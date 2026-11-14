@@ -8,9 +8,9 @@
 
 ## 安装与运行
 
-### 使用 Windows 便携版
+### 使用 Windows 打包版
 
-便携版可按下方构建说明在本地生成。将生成的 `ClassInExporter-0.4.0-win64.zip` 完整解压后运行 `ClassInExporter/ClassInExporter.exe`。保留同目录下的 `_internal` 文件夹。默认导出到同目录下的 `exports`。
+打包版可按下方构建说明在本地构建。将生成的 `ClassInExporter-0.4.1-win64.zip` 解压后运行 `ClassInExporter/ClassInExporter.exe`。默认导出到同目录下的 `exports`。
 
 ### 从源码运行
 

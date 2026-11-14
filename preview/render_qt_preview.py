@@ -62,6 +62,7 @@ def inject_download_state(window: ExporterApp, state: str) -> None:
     window._resource_progress.clear()
     window.statuses.update({resource_id: "等待下载" for resource_id in ids})
     window._set_busy("download")
+    window._render()
     for index, resource_id in enumerate(ids[:2], 1):
         window._handle_event(WorkerEvent("download_started", {"resource_id": resource_id, "index": index, "total": len(ids)}))
         total = window.resources[resource_id].size
@@ -77,6 +78,7 @@ def inject_download_state(window: ExporterApp, state: str) -> None:
         window._handle_event(WorkerEvent("batch_finished", {"completed": 0, "failed": 3,
                                                             "remaining": 0, "cancelled": False}))
         window._handle_event(WorkerEvent("worker_finished", {"operation": "download"}))
+    window._flush_download_updates()
     window.session_text.setText("合成任务状态 · 未发起下载")
 
 

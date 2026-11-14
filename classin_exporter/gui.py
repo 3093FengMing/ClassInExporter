@@ -1,4 +1,4 @@
-"""Chinese Qt desktop UI with network/file work isolated in QThread jobs."""
+"""A Qt desktop UI with network/file work isolated in QThread jobs."""
 
 from __future__ import annotations
 
@@ -9,13 +9,14 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 import requests
-from PySide6.QtCore import QEvent, QObject, QSignalBlocker, QSize, QStandardPaths, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QSignalBlocker, QSize, QStandardPaths, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QFont, QFontDatabase, QKeyEvent, QKeySequence, QResizeEvent, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QGridLayout,
@@ -174,6 +175,7 @@ class BackgroundWorker(QObject):
     """Serial Qt jobs. Signals are the only path from a job to GUI widgets."""
 
     event_ready = Signal(object)
+    _events_pending = Signal()
 
     def __init__(self, client_factory: Callable[..., ClassInClient] = _make_client,
                  manager_factory: Callable[..., DownloadManager] = DownloadManager,
@@ -185,6 +187,14 @@ class BackgroundWorker(QObject):
         self.client: ClassInClient | None = None
         self.cancel_event = threading.Event()
         self._thread: _OperationThread | None = None
+        self._event_queue: deque[WorkerEvent] = deque()
+        self._event_lock = threading.Lock()
+        self._event_delivery_scheduled = False
+        self._event_timer = QTimer(self)
+        self._event_timer.setSingleShot(True)
+        self._event_timer.setInterval(1)
+        self._event_timer.timeout.connect(self._deliver_events)
+        self._events_pending.connect(self._deliver_events, Qt.ConnectionType.QueuedConnection)
 
     @property
     def running(self) -> bool:
@@ -193,7 +203,26 @@ class BackgroundWorker(QObject):
         return self._thread is not None
 
     def _emit(self, kind: str, **data) -> None:
-        self.event_ready.emit(WorkerEvent(kind, data))
+        with self._event_lock:
+            self._event_queue.append(WorkerEvent(kind, data))
+            wake = not self._event_delivery_scheduled
+            self._event_delivery_scheduled = True
+        if wake:
+            self._events_pending.emit()
+
+    @Slot()
+    def _deliver_events(self) -> None:
+        # One wakeup serves a burst of worker events. Deliver bounded batches
+        # on the main thread so input and repaint events can run between them.
+        with self._event_lock:
+            events = [self._event_queue.popleft() for _ in range(min(64, len(self._event_queue)))]
+            more = bool(self._event_queue)
+            if not more:
+                self._event_delivery_scheduled = False
+        for event in events:
+            self.event_ready.emit(event)
+        if more:
+            self._event_timer.start()
 
     def _launch(self, operation: str, target: Callable[[], None]) -> bool:
         if self.running:
@@ -416,7 +445,12 @@ class ExporterApp(QMainWindow):
         self._active_downloads: set[str] = set()
         self._finished_downloads: set[str] = set()
         self._resource_progress: dict[str, tuple[int, int]] = {}
-        self.setWindowTitle("ClassIn 资源导出")
+        self._pending_status_updates: set[str] = set()
+        self._download_update_timer = QTimer(self)
+        self._download_update_timer.setSingleShot(True)
+        self._download_update_timer.setInterval(50)
+        self._download_update_timer.timeout.connect(self._flush_download_updates)
+        self.setWindowTitle("ClassInExporter")
         self.resize(1280, 800)
         self.setMinimumSize(920, 680)
         font = _ui_font()
@@ -555,7 +589,7 @@ class ExporterApp(QMainWindow):
         course = readable_text(resource.course or "未归属", 4096)
         source = SOURCE_LABELS.get(resource.source, "发现的资源")
         qualification = "不可下载" if not selectable_resource(resource) else "优先下载远程原件"
-        detail = f"{course} / {source}　 {resource_size_label(resource)}　 {status}　 {qualification}"
+        detail = f"{course} / {source} {resource_size_label(resource)} {status} {qualification}"
         self.detail_meta.setText(detail)
         self.detail_meta.setToolTip(detail)
 
@@ -675,13 +709,15 @@ class ExporterApp(QMainWindow):
         self._active_downloads.clear()
         self._finished_downloads.clear()
         self._resource_progress.clear()
+        self._download_update_timer.stop()
+        self._pending_status_updates.clear()
         if self.worker.start_download(resources, output_path, self.download_threads.value(),
                                       resource_snapshot=list(self.resources.values())):
             for resource in resources:
                 self.statuses[resource.id] = "等待下载"
+                self._queue_download_update(resource.id)
             self._set_busy("download")
             self.progress_text.setText(f"正在准备 {len(resources)} 个资源…")
-            self._render()
 
     @Slot()
     def cancel(self) -> None:
@@ -840,25 +876,16 @@ class ExporterApp(QMainWindow):
                     self.checked.discard(resource_id)
                 item.setData(0, Qt.ItemDataRole.UserRole + 3, not selectable)
                 item.setCheckState(0, Qt.CheckState.Checked if resource_id in self.checked else Qt.CheckState.Unchecked)
-                status = self.statuses.get(resource_id, initial_resource_status(resource))
                 name = readable_text(resource.name, 4096)
                 course = readable_text(resource.course or "未归属", 4096)
                 source = SOURCE_LABELS.get(resource.source, "发现的资源")
-                values = (name, kind_label(resource), course, resource_size_label(resource), source, status)
+                values = (name, kind_label(resource), course, resource_size_label(resource), source)
                 for column, value in enumerate(values, 1):
                     item.setText(column, value)
                     item.setToolTip(column, value)
                     item.setForeground(column, QColor(TOKENS["secondary"] if column == 4 else TOKENS["text"]))
                 item.setData(1, Qt.ItemDataRole.UserRole + 1, f"{course}-{source}")
-                item.setData(1, Qt.ItemDataRole.AccessibleTextRole, f"{name}，{course}，{source}，{status}")
-                display_status = status
-                if not selectable and "809" in status:
-                    display_status = "权限不足（809）\n录像未确认"
-                elif resource_id not in self.statuses and any(word in status for word in ("未确认", "片段", "部分")):
-                    display_status = "缓存完整性未确认"
-                elif resource_id not in self.statuses and status.startswith("完整缓存"):
-                    display_status = "完整缓存"
-                item.setData(6, Qt.ItemDataRole.UserRole + 2, display_status)
+                self._update_resource_status(resource_id)
                 item.setHidden(resource_id not in visible_ids)
             current = self.tree.currentItem()
             if current is None or current.isHidden():
@@ -885,6 +912,31 @@ class ExporterApp(QMainWindow):
             else:
                 self.empty_title.setText("此范围暂无资源")
                 self.empty_text.setText("可切换课程、云盘或资源类型，也可以重新获取资源。")
+
+    def _update_resource_status(self, resource_id: str) -> None:
+        resource = self.resources.get(resource_id)
+        item = self.items.get(resource_id)
+        if resource is None or item is None:
+            return
+        status = self.statuses.get(resource_id, initial_resource_status(resource))
+        display_status = status
+        if not selectable_resource(resource) and "809" in status:
+            display_status = "权限不足（809）\n录像未确认"
+        elif resource_id not in self.statuses and any(word in status for word in ("未确认", "片段", "部分")):
+            display_status = "缓存完整性未确认"
+        elif resource_id not in self.statuses and status.startswith("完整缓存"):
+            display_status = "完整缓存"
+        # Download events do not change names, filters or selection. Updating
+        # just this row keeps concurrent progress from rebuilding the table.
+        with QSignalBlocker(self.tree):
+            item.setText(6, status)
+            item.setToolTip(6, status)
+            item.setForeground(6, QColor(TOKENS["text"]))
+            item.setData(6, Qt.ItemDataRole.UserRole + 2, display_status)
+            item.setData(1, Qt.ItemDataRole.AccessibleTextRole,
+                         f"{item.text(1)}，{item.text(3)}，{item.text(5)}，{status}")
+        if self._detail_resource_id == resource_id:
+            self._update_detail()
 
     def _update_summary(self) -> None:
         visible_ids = {resource_id for resource_id, item in self.items.items() if not item.isHidden()}
@@ -970,6 +1022,22 @@ class ExporterApp(QMainWindow):
             self.progress_text.setText(f"下载：已完成 {len(self._finished_downloads)} / {self._download_total} 项，"
                                        f"进行中 {len(self._active_downloads)} 项。")
 
+    def _queue_download_update(self, resource_id: str) -> None:
+        self._pending_status_updates.add(resource_id)
+        if not self._download_update_timer.isActive():
+            self._download_update_timer.start()
+
+    @Slot()
+    def _flush_download_updates(self) -> None:
+        self._download_update_timer.stop()
+        if not self._pending_status_updates:
+            return
+        pending = self._pending_status_updates
+        self._pending_status_updates = set()
+        for resource_id in pending:
+            self._update_resource_status(resource_id)
+        self._download_summary()
+
     @Slot(object)
     def _handle_event(self, event: WorkerEvent) -> None:
         data, kind = event.data, event.kind
@@ -986,6 +1054,7 @@ class ExporterApp(QMainWindow):
             self.progress_text.setText(f"已导入 {len(resources)} 个资源，当前共 {len(self.resources)} 项。")
             self._message("已补充导入Json Manifest")
         elif kind == "failed":
+            self._flush_download_updates()
             self.progress_text.setText(data["message"])
             if data["operation"] == "scan":
                 self.session_text.setText("本次扫描未完成。")
@@ -995,51 +1064,54 @@ class ExporterApp(QMainWindow):
             self._message(data["message"])
         elif kind == "download_started":
             resource_id = data["resource_id"]
+            if resource_id in self._finished_downloads:
+                return
             self.statuses[resource_id] = "正在获取 / 下载"
             self._active_downloads.add(resource_id)
-            self._download_summary()
-            self._render()
+            self._queue_download_update(resource_id)
         elif kind == "progress":
+            resource_id = data["resource_id"]
+            if resource_id in self._finished_downloads:
+                return
             done, total = data["done"], data["total"]
-            self._resource_progress[data["resource_id"]] = (done, total)
-            self._download_summary()
-            self.statuses[data["resource_id"]] = f"下载 {done * 100 / total:.0f}%" if total > 0 else f"已接收 {format_size(done)}"
-            self._render()
+            self._resource_progress[resource_id] = (done, total)
+            self.statuses[resource_id] = f"下载 {done * 100 / total:.0f}%" if total > 0 else f"已接收 {format_size(done)}"
+            self._queue_download_update(resource_id)
         elif kind in ("download_warning", "download_failed"):
             resource_id = data["resource_id"]
             if kind == "download_failed":
                 self.statuses[resource_id] = "下载失败"
                 self._active_downloads.discard(resource_id)
                 self._finished_downloads.add(resource_id)
-                self._download_summary()
+                self._queue_download_update(resource_id)
             self._message(f"{readable_text(self.resources[resource_id].name, 100)}：{data['message']}")
-            self._render()
         elif kind == "download_finished":
             download_result: DownloadResult = data["result"]
             self._active_downloads.discard(data["resource_id"])
             self._finished_downloads.add(data["resource_id"])
-            self._download_summary()
             suffix = "远程原件" if download_result.source == "remote" else "完整缓存"
             self.statuses[data["resource_id"]] = f"已导出 · {suffix}"
             self._message(f"已导出：{Path(download_result.path).name}（{format_size(download_result.bytes_written)}，{suffix}）")
-            self._render()
+            self._queue_download_update(data["resource_id"])
         elif kind == "download_cancelled":
             self._active_downloads.discard(data["resource_id"])
             self._finished_downloads.add(data["resource_id"])
-            self._download_summary()
             self.statuses[data["resource_id"]] = "已取消"
-            self._render()
+            self._queue_download_update(data["resource_id"])
         elif kind == "batch_finished":
             for resource_id, status in self.statuses.items():
                 if status == "等待下载":
                     self.statuses[resource_id] = "未开始"
+                    self._queue_download_update(resource_id)
+            # Flush before the final summary so the timer cannot overwrite it.
+            self._flush_download_updates()
             text = f"{'下载已取消' if data['cancelled'] else '批量下载结束'}：成功 {data['completed']} 项，失败 {data['failed']} 项"
             if data["cancelled"]:
                 text += f"，取消或未开始 {data['remaining']} 项"
             self.progress_text.setText(text + "。")
             self._message(text + "。")
-            self._render()
         elif kind == "worker_finished":
+            self._flush_download_updates()
             self._set_progress(0)
             self._set_busy("")
             if self._closing:
@@ -1050,7 +1122,7 @@ class ExporterApp(QMainWindow):
             event.ignore()
             self._closing = True
             self.worker.cancel()
-            self.progress_text.setText("正在结束后台任务，清理完成后关闭窗口…")
+            self.progress_text.setText("正在结束后台任务...")
             self._set_busy(self._busy)
         else:
             self.worker.close_client()

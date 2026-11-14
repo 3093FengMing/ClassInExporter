@@ -1,4 +1,4 @@
-ClassInExporter 0.4.0
+ClassInExporter 0.4.1
 Required Notice: Copyright (c) 2026 3093FengMing
 
 使用方法
@@ -9,7 +9,6 @@ Required Notice: Copyright (c) 2026 3093FengMing
 5. 点击“下载已选”批量下载。
 
 默认导出位置在 exports 文件夹。
-课程资源在文件夹“课程名 + Hash”下保存。
 点击“设置”可更改安装目录，以及获取 / 下载线程数。
 切换 ClassIn 账号后请重新扫描资源。
 

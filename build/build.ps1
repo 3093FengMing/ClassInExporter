@@ -16,7 +16,7 @@ $pythonPath = Join-Path $venvDirectory 'Scripts\python.exe'
 $workDirectory = Join-Path $projectDirectory '.build'
 $distDirectory = [System.IO.Path]::GetFullPath((Join-Path $projectDirectory $OutputDirectory))
 $bundleDirectory = Join-Path $distDirectory 'ClassInExporter'
-$archivePath = Join-Path $distDirectory 'ClassInExporter-0.4.0-win64.zip'
+$archivePath = Join-Path $distDirectory 'ClassInExporter-0.4.1-win64.zip'
 
 function Invoke-BuildPython {
     param([string[]]$Arguments)
