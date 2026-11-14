@@ -262,7 +262,7 @@ class ResourceDelegate(QStyledItemDelegate):
             display = str(index.data(Qt.ItemDataRole.UserRole + 2) or value)
             color = TOKENS["error"] if value == "下载失败" else TOKENS["warning"] if any(
                 word in value for word in ("未确认", "权限", "部分", "片段")) else TOKENS["accent"] if (
-                    value.startswith("已导出") or "完整缓存" in value) else TOKENS["text"]
+                    value.startswith(("已导出", "已下载")) or "完整缓存" in value) else TOKENS["text"]
             painter.setPen(QColor(color))
             font.setPixelSize(13)
             painter.setFont(font)

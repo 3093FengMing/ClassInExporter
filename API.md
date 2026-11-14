@@ -1,6 +1,6 @@
 # API 与实现导读
 
-既有实测记录针对 ClassIn 6.0.5.4000（Windows x64）。
+早期实测记录针对 ClassIn 6.0.5.4000（Windows x64）。ClassInExporter 0.4.2 另已验证 ClassIn **6.0.9.3151** 的重复当前会话复核、个人云盘 form 请求、tokenExchange 和课程列表 JSON 请求。这里的客户端版本来自当前设备信息，安装 PE 的文件版本可能滞后。
 
 项目采用 [PolyForm Noncommercial 1.0.0](LICENSE)，复制或分发源码及允许的派生作品时须保留 [NOTICE](NOTICE) 中的署名与许可信息。第三方依赖各自保留其许可。许可不授予课程、录播或机构 API 的访问权限。
 
@@ -26,11 +26,33 @@
 
 ### native 获取的职责与更新兼容性
 
-`session.load_current_session()` 检测主进程，读取当前账号 UID、会话签名字段、access/refresh token、设备与客户端信息、API/CDN 配置和缓存目录。`ClassInSession` 用这些信息签名请求，并复核登录和账号是否变化。课程及云盘分页、资料详情、原件刷新和下载由后续 HTTP 适配器完成；音视频处理位于下载器与 FFmpeg 链路。
+`session.load_current_session()` 检测主进程，读取当前账号 UID、会话签名字段、设备与客户端信息、API/CDN 配置和缓存目录。原生解析从当前安装文件的导出符号、getter 指令、真实 QString 复制调用和命名服务 getter 的转发关系推导字段，运行时只读取这些已确认对象。旧版保留已验证的 `TokenState` getter 路线，并在 token owner 与当前 UID 一致时读取 access/refresh token；新版缺少该 getter 时，从设备 getter 读取客户端信息，通过正常 tokenExchange 请求取得业务 token，不搜索全进程内存中的可疑 token 文本。
 
-动态模块基址和导出函数分析能适应加载地址及部分函数位置变化，但当前实现仍依赖已验证的虚函数表槽位、令牌状态字段和 Qt 字符串布局。**不能据此保证任意新版兼容。** 更新后应依次验证会话读取、最小只读请求、资源刷新和小文件完整下载；结构验证失败时会报告客户端结构无法识别。
+`ClassInSession` 用这些信息签名请求，并在复制会话前后以及认证请求前后复核当前登录、账号和签名字段。主进程、x64 模块、函数与数据地址范围、HTTPS 配置和 Qt 字符串边界均须满足已确认结构。课程及云盘分页、资料详情、原件刷新和下载由后续 HTTP 适配器完成；音视频处理位于下载器与 FFmpeg 链路。
+
+动态模块基址和导出函数分析能适应加载地址及部分函数位置变化，但当前实现仍依赖已验证的虚函数表槽位、原生对象和 Qt 字符串布局。新版 CDN 由 `CdnManager` 返回时，还核验服务 getter、容器取首项调用链和 URL 字段。**不能据此保证任意新版兼容。** 更新后应依次验证会话读取、最小只读请求、资源刷新和小文件完整下载；结构验证失败时停止读取，向界面传递安全的具体原因。
+
+Qt 窗口启动时在后台执行登录检测，完成后再由用户触发资源扫描。独立诊断可运行 `python -m classin_exporter.login_probe`；默认只复核当前原生会话，结果不包含账号值、凭据或真实资源地址。
+
+6.0.9.3151 的本轮线上验证包括：多次当前会话复核一致；`/cloudspace/api/user/getFolderList` 返回业务 `errno=1`；缺少原生 token getter 时 tokenExchange 成功；`/course/app/member/course_list` 使用 `page=1, pageSize=40, states=[0]` 返回 `errno=1` 和两条课程记录。这里只公开版本、业务结果和数量，不公开响应正文。课堂回放 809 和课程补充目录 HTTP 404 的未确认边界继续保留。
 
 复用时宜把 native 会话读取与 HTTP 协议适配分开维护。新版改变对象布局时更新前者；接口、签名或响应字段变化时核验后者。官方机构 SDK 使用 SID 和机构密钥，是另一种授权来源，适合独立机构适配器。
+
+### 本轮结构差异与指令特征
+
+下表仅说明已保存旧版证据与 6.0.9.3151 的差异；偏移使用十进制字节数，不作为未来版本的固定地址。
+
+| 对象 / 字段 | 旧版 | 6.0.9.3151 |
+| --- | --- | --- |
+| CoreEngine → LoginObject | `core + 72` | `core + 64` |
+| UID / telephone / appSecret | `core + 80 / 128 / 256` | 这些字段偏移保持；secret getter 增加登录与空值分支 |
+| LoginObject → settings | `config + 24` | 保持 |
+| 当前登录字节 | `settings + 190` | `settings + 194` |
+| static / dynamic CDN | settings 内的 QString，`+104 / +120` | `settings + 8 → manager`，`manager + 48 → QVector`，首节点 QString `+8 / +24` |
+| access / refresh token | 经命名 TokenState getter，核对 owner 后读取 | 旧 getter 已移除；不沿用相邻偏移，通过 tokenExchange 获取 |
+| device map | 已核验 TokenState 字段 | 独立 `EeoBaseUtils::getDeviceMap()` 的返回 QString |
+
+当前 `LoginObject::isLogined()` 中读取 settings 的字节为 `48 8B 40 18`，读取登录标志为 `0F B6 80 C2 00 00 00`。后者可抽象为 `0F B6 80 ?? ?? ?? ??`，再从解码指令取得偏移，但此掩码会匹配其他字节字段，不能单独证明登录状态。实现先定位命名导出，核对 UID getter 的调用关系、实际虚表、字段来源和读取前后账号一致性。QString 还核对真实复制 / 移动调用的输入与返回对象，容器取首项核对完整短函数链，未知结构停止读取。
 
 ## 源码模块导读
 
@@ -43,6 +65,8 @@
 | [lms_record.py](classin_exporter/lms_record.py) | 录播活动详情、原件与转码播放资源区分、按稳定文件标识刷新 |
 | [cache.py](classin_exporter/cache.py) | 只读解析 Qt 磁盘缓存、正文完整性、缓存资源索引 |
 | [downloader.py](classin_exporter/downloader.py) | `DownloadManager`、远程优先、完整缓存回退、HLS、取消、摘要与原子完成 |
+| [download_history.py](classin_exporter/download_history.py) | `lookup_download`、`find_downloaded_resources`、相对路径下载记录、内容校验、旧导出恢复与重复请求锁 |
+| [login_probe.py](classin_exporter/login_probe.py) | 安全的当前会话诊断 CLI，不输出账号值或 token |
 | [resources.py](classin_exporter/resources.py) | `Resource`、`ScanResult`、`DownloadResult` 数据结构 |
 | [grouping.py](classin_exporter/grouping.py) | 课程与云盘分组、无 hash 目录命名、重名编号和全量扫描目录计划 |
 | [gui.py](classin_exporter/gui.py) | Qt 后台扫描、并发批量下载与主线程事件协调 |
@@ -71,9 +95,9 @@
 
 JSON 序列化递归按 QString 键顺序生成无空格 UTF-8 字节，保留非 ASCII 文本并拒绝非有限数字。令 `n=timestamp % 10`：body 长度大于 `n` 时在字节位置 `n` 插入十进制时间戳，否则追加到末尾，再计算小写 MD5。重新序列化、换空白或改变键顺序都会改变签名。
 
-过期 token 优先走 `/usercenter/v2/app/user/refresh-token`，body 为 `uid`、`refreshToken`
-缺少 refresh token 时实现 `/zero-usercenter/app/user/tokenExchange`，body 为 `uid`、`token`。
-静态解析与实现使用响应字段 `data.token`、`refreshToken`、`expires`、`expTime`。
+过期 token 优先走 `/usercenter/v2/app/user/refresh-token`，body 为 `uid`、`refreshToken`。缺少 refresh token 时走 `/zero-usercenter/app/user/tokenExchange`，body 为 `uid`、`token`；其中交换用 token 由 `session._make_exchange_token()` 按已确认的 AES-128-CBC / HS256 envelope 生成，不能把任意缓存字符串当作它的替代值。新版缺少原生 token getter 时同样使用此路线，6.0.9.3151 已实测成功。
+
+解析响应字段 `data.token`、`refreshToken`、`expires`、`expTime`，校验有效期并保持 token 更新的并发互斥与账号一致性。获取到的凭据仅保留于内存，不写入下载记录或诊断输出。
 
 下面演示真实公开函数。
 
@@ -220,7 +244,9 @@ Qt `.d` 缓存是 QNetworkDiskCache 容器，包含元数据与正文。只读�
 
 ```python
 from classin_exporter.discovery import ClassInClient
+from classin_exporter.download_history import lookup_download
 from classin_exporter.downloader import DownloadManager
+from classin_exporter.grouping import resource_output_dir
 
 client = ClassInClient(max_workers=4)
 try:
@@ -229,9 +255,14 @@ try:
         print(warning)
     selected_id = input("输入本次扫描中要导出的稳定资源 ID：")
     selected = next(item for item in scan.resources if item.id == selected_id)
-    fresh = client.resolve(selected)
-    result = DownloadManager("exports", session=client.session).download(fresh)
-    print(result.source, result.bytes_written, result.sha256)
+    output = resource_output_dir("exports", selected, resources=scan.resources)
+    existing = lookup_download(selected, output, verify_changed=True, recover_legacy=True)
+    if existing is not None:
+        print("已下载，跳过", existing.source, existing.bytes_written)
+    else:
+        fresh = client.resolve(selected)
+        result = DownloadManager(output, session=client.session).download(fresh)
+        print(result.source, result.bytes_written, result.sha256, result.skipped)
 finally:
     if client.auth_session is not None:
         client.auth_session.close()

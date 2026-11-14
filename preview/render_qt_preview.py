@@ -18,6 +18,7 @@ from PySide6.QtCore import Qt, QEvent
 from PySide6.QtWidgets import QApplication, QDialog
 
 from classin_exporter.gui import BackgroundWorker, ExporterApp, WorkerEvent
+from classin_exporter.download_history import ExistingDownload
 from classin_exporter.resources import Resource
 
 
@@ -55,7 +56,7 @@ def preview_warnings() -> list[str]:
 
 def inject_download_state(window: ExporterApp, state: str) -> None:
     """Replay real UI events without starting a transport or a worker job."""
-    ids = ["preview-material", "preview-video", "preview-complete-cache"]
+    ids = ["preview-material", "preview-video", "preview-partial-cache"]
     window._download_total = len(ids)
     window._active_downloads.clear()
     window._finished_downloads.clear()
@@ -90,7 +91,7 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=800)
     parser.add_argument("--export-label", default="exports", help="Displayed export directory in the synthetic preview")
     parser.add_argument("--state", choices=("main", "hidden", "permission", "empty", "settings", "tasks", "focus",
-                                            "small", "downloading", "canceling", "failed", "stress"), default="main")
+                                            "small", "downloaded", "downloading", "canceling", "failed", "stress"), default="main")
     args = parser.parse_args()
     # A hard guard protects this standalone preview even if a future GUI change
     # accidentally starts a scan or request. No real client is constructed.
@@ -102,7 +103,7 @@ def main() -> None:
     worker = BackgroundWorker(client_factory=block_external_work,
                               manager_factory=block_external_work,
                               manifest_reader=block_external_work)
-    window = ExporterApp(worker=worker)
+    window = ExporterApp(worker=worker, auto_detect=False)
     if args.state == "small" and (args.width, args.height) == (1280, 800):
         args.width, args.height = 960, 680
     window.resize(args.width, args.height)
@@ -113,7 +114,11 @@ def main() -> None:
     window._load_resources(resources, replace=True)
     window.session_text.setText("已检测到 ClassIn 登录")
     window.output_dir.setText(args.export_label)
-    window.checked.update({"preview-material", "preview-video", "preview-complete-cache"})
+    # Model one verified local export in memory; this fixture never reads files.
+    downloaded_id = "preview-complete-cache"
+    window._downloaded[downloaded_id] = ExistingDownload("示例已下载资源.pdf", resources[2].size, "0" * 64, "cache")
+    window._download_output_root = window._output_path()
+    window.checked.update({"preview-material", "preview-video", "preview-partial-cache"})
 
     # Exercise the real combined filters, then show all resource categories in
     # the final frame while retaining a visible, active name filter.
@@ -128,6 +133,9 @@ def main() -> None:
     candidate = window.items["preview-denied-replay"]
     assert not candidate.flags() & Qt.ItemFlag.ItemIsUserCheckable
     assert candidate.checkState(0) == Qt.CheckState.Unchecked
+    assert window.items[downloaded_id].text(6) == "已下载 · 完整缓存"
+    assert not window.items[downloaded_id].flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert window.items[downloaded_id].checkState(0) == Qt.CheckState.Unchecked
     assert not worker.running
 
     window._set_scan_warnings(preview_warnings())
@@ -142,6 +150,12 @@ def main() -> None:
         window.tree.setCurrentItem(candidate)
     elif args.state == "empty":
         window.name_filter.setText("不存在的资源名称")
+    elif args.state == "downloaded":
+        window._bulk_check("all")
+        assert downloaded_id not in window.checked
+        assert "preview-denied-replay" not in window.checked
+        window.tree.setCurrentItem(window.items[downloaded_id])
+        window.progress_text.setText("已下载内容会在全选和批量下载时跳过")
     elif args.state in {"downloading", "canceling", "failed"}:
         inject_download_state(window, args.state)
     window.show()
@@ -184,6 +198,8 @@ def main() -> None:
                       "visible_ids": [row.id for row in window._visible()],
                       "selected_id": current_item.data(0, Qt.ItemDataRole.UserRole) if current_item is not None else None,
                       "candidate_checkable": False, "network_requests": 0,
+                      "downloaded_ids": sorted(window._downloaded),
+                      "downloaded_checkable": bool(window.items[downloaded_id].flags() & Qt.ItemFlag.ItemIsUserCheckable),
                       "worker_running": worker.running, "busy_state": window._busy,
                       "cancel_requested": worker.cancel_event.is_set(),
                       "supplemental_unconfirmed_count": len(preview_warnings()), "state": args.state,

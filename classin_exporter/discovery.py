@@ -601,8 +601,13 @@ class ClassInClient:
         session = None
         try:
             session = self._current_session()
-        except Exception:
-            warnings.append("无法读取当前 ClassIn 登录状态，仅显示本地历史缓存。")
+        except Exception as error:
+            from .session import SessionError
+            self._session_error = (str(error) if isinstance(error, SessionError)
+                                   else "无法读取当前 ClassIn 登录状态。")
+            warnings.append(self._session_error + " 仅显示本地历史缓存，当前登录尚未确认。")
+        else:
+            self._session_error = ""
         cache_root = self.local_dir / "cache"
         if session is not None:
             active_cache = getattr(session, "cache_directory", None)

@@ -90,7 +90,7 @@ def self_test(output: Path) -> int:
         result["ffmpeg"] = str(ffmpeg)
 
         application = QApplication.instance() or QApplication([])
-        window = ExporterApp()
+        window = ExporterApp(auto_detect=False)
         window.show()
         application.processEvents()
         result["qt_window"] = bool(window.isVisible())

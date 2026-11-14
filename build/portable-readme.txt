@@ -1,4 +1,4 @@
-ClassInExporter 0.4.1
+ClassInExporter 0.4.2
 Required Notice: Copyright (c) 2026 3093FengMing
 
 使用方法

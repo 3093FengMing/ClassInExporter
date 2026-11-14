@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+from urllib.parse import urlsplit
 
 import requests
 from PySide6.QtCore import QEvent, QObject, QSignalBlocker, QSize, QStandardPaths, QThread, QTimer, Qt, QUrl, Signal, Slot
@@ -27,7 +28,9 @@ from PySide6.QtWidgets import (
 )
 
 from .downloader import DownloadCancelled, DownloadError, DownloadManager
+from .download_history import ExistingDownload, find_downloaded_resources, lookup_download
 from .resources import DownloadResult, Resource, ScanResult
+from .session import SessionError
 from .grouping import group_directory_names, group_labels, resource_group, resource_output_dir
 from .gui_workspace import build_workspace
 from .gui_views import TOKENS
@@ -99,6 +102,23 @@ def initial_resource_status(resource: Resource) -> str:
     return readable_text(resource.metadata.get("cache_status") or "待下载")
 
 
+def download_source_label(resource: Resource | None, source: str) -> str:
+    if source != "remote":
+        return "完整缓存"
+    if resource is not None:
+        try:
+            playlist_url = urlsplit(resource.url).path.lower().endswith((".m3u8", ".pm3u8"))
+        except ValueError:
+            playlist_url = False
+        if (playlist_url or str(resource.metadata.get("stream_type", "")).lower() == "hls"
+                or resource.metadata.get("stream_entry_only") is True):
+            return "HLS合并"
+        if (resource.metadata.get("content_role") == "transcoded-playback"
+                or resource.metadata.get("original_available") is False):
+            return "播放资源"
+    return "远程原件"
+
+
 def kind_label(resource: Resource) -> str:
     return KIND_LABELS.get(KIND_ALIASES.get(resource.kind, resource.kind), "其他文件")
 
@@ -166,6 +186,8 @@ class _OperationThread(QThread):
                 "scan": "资源扫描失败，请确认 ClassIn 已登录，并检查安装目录和网络连接。",
                 "import": "无法读取资源清单，请检查 JSON 格式和文件权限。",
                 "download": "无法开始批量下载，请检查导出目录和资源信息。",
+                "history": "无法检查已下载内容，请检查导出目录后重试。",
+                "detect": "无法检测 ClassIn 登录状态，请确认 ClassIn 已打开并登录后重新获取资源。",
             }
             # Unexpected exception messages can contain credentials or URLs.
             self.worker._emit("failed", operation=self.operation, message=messages[self.operation])
@@ -263,10 +285,52 @@ class BackgroundWorker(QObject):
             self._emit("scan_finished", result=result)
         return self._launch("scan", scan)
 
+    def start_detect(self, install_dir: str | None = None) -> bool:
+        def detect():
+            self.close_client()
+            candidate = None
+            try:
+                if self.cancel_event.is_set():
+                    raise DownloadCancelled("登录检测已取消。")
+                candidate = self.client_factory(install_dir=install_dir)
+                session = candidate._current_session()
+                if self.cancel_event.is_set():
+                    raise DownloadCancelled("登录检测已取消。")
+                session._check_login()
+                diagnostics = session.diagnostics()
+                if not diagnostics.get("uid_available") or not diagnostics.get("signing_secret_available"):
+                    raise SessionError("ClassIn 当前登录信息不完整，请登录成功后重新获取资源。")
+                if self.cancel_event.is_set():
+                    raise DownloadCancelled("登录检测已取消。")
+                self.client = candidate
+                self._emit("login_detected")
+            except DownloadCancelled:
+                self._emit("login_cancelled")
+            except SessionError as error:
+                self._emit("login_cancelled" if self.cancel_event.is_set() else "login_failed",
+                           message=readable_text(error))
+            finally:
+                if candidate is not None and candidate is not self.client:
+                    session = getattr(candidate, "auth_session", None)
+                    if session is not None:
+                        session.close()
+        return self._launch("detect", detect)
+
     def start_import(self, path: str) -> bool:
         def import_manifest():
             self._emit("import_finished", resources=self.manifest_reader(path))
         return self._launch("import", import_manifest)
+
+    def start_history(self, resources: list[Resource], output_dir: str, generation: int) -> bool:
+        def history():
+            try:
+                downloaded = find_downloaded_resources(resources, output_dir, cancel=self.cancel_event)
+            except DownloadCancelled:
+                self._emit("history_cancelled", generation=generation)
+            else:
+                self._emit("history_finished", downloaded=downloaded, output_dir=output_dir,
+                           generation=generation)
+        return self._launch("history", history)
 
     def start_download(self, resources: list[Resource], output_dir: str, max_workers: int = 4,
                        *, resource_snapshot: list[Resource] | None = None) -> bool:
@@ -277,7 +341,14 @@ class BackgroundWorker(QObject):
         directory_names = group_directory_names(list(resource_snapshot) if resource_snapshot is not None else resources)
 
         def download():
-            completed = failed = 0
+            completed = failed = skipped = 0
+            # The course plan is fixed for this batch. Resolve each destination
+            # once in the background rather than for every concurrent file.
+            course_dirs: dict[str, Path] = {}
+            for resource in batch:
+                group_key = resource_group(resource)[0]
+                if group_key not in course_dirs:
+                    course_dirs[group_key] = resource_output_dir(output_dir, resource, directory_names=directory_names)
             def transfer(index, resource):
                 if self.cancel_event.is_set():
                     return "not_started"
@@ -294,11 +365,19 @@ class BackgroundWorker(QObject):
                 refresh_message = ""
                 owned_transport = None
                 try:
+                    course_dir = course_dirs[resource_group(resource)[0]]
+                    existing = lookup_download(resource, course_dir, verify_changed=True,
+                                               recover_legacy=True, cancel=self.cancel_event)
+                    if existing is not None:
+                        result = DownloadResult(resource.id, existing.path, existing.source,
+                                                existing.bytes_written, existing.sha256, skipped=True,
+                                                warning=existing.warning)
+                        self._emit("download_finished", resource_id=resource.id, result=result)
+                        return "skipped"
                     transport = getattr(self.client, "session", None)
                     if transport is None:
                         owned_transport = transport = requests.Session()
-                    manager = self.manager_factory(resource_output_dir(output_dir, resource,
-                                                                       directory_names=directory_names), session=transport)
+                    manager = self.manager_factory(course_dir, session=transport)
                     resolved = resource
                     if self.client is not None:
                         try:
@@ -318,7 +397,7 @@ class BackgroundWorker(QObject):
                         raise DownloadCancelled("下载已取消。")
                     result = manager.download(resolved, progress=progress, cancel=self.cancel_event)
                     self._emit("download_finished", resource_id=resource.id, result=result)
-                    return "completed"
+                    return "skipped" if result.skipped else "completed"
                 except DownloadCancelled:
                     self._emit("download_cancelled", resource_id=resource.id)
                     return "cancelled"
@@ -365,13 +444,14 @@ class BackgroundWorker(QObject):
                         outcome = future.result()
                         completed += outcome == "completed"
                         failed += outcome == "failed"
+                        skipped += outcome == "skipped"
                     if self.cancel_event.is_set():
                         for future in pending:
                             future.cancel()
                     else:
                         replenish()
-            self._emit("batch_finished", completed=completed, failed=failed,
-                       cancelled=self.cancel_event.is_set(), remaining=len(batch) - completed - failed)
+            self._emit("batch_finished", completed=completed, failed=failed, skipped=skipped,
+                       cancelled=self.cancel_event.is_set(), remaining=len(batch) - completed - failed - skipped)
         return self._launch("download", download)
 
     def cancel(self) -> None:
@@ -432,13 +512,32 @@ class ExporterApp(QMainWindow):
     summary_text: QLabel
     resource_detail_text: QPlainTextEdit
 
-    def __init__(self, parent: QWidget | None = None, worker: BackgroundWorker | None = None):
+    def __init__(self, parent: QWidget | None = None, worker: BackgroundWorker | None = None,
+                 *, auto_detect: bool | None = None):
         super().__init__(parent)
+        # Injected workers are offline fixtures unless startup detection is
+        # explicitly requested; the normal desktop app detects on every launch.
+        self._startup_detection_enabled = (worker is None) if auto_detect is None else auto_detect
         self.worker = worker or BackgroundWorker(parent=self)
+        self._startup_timer = QTimer(self)
+        self._startup_timer.setSingleShot(True)
+        self._startup_timer.timeout.connect(self.detect_login)
         self.resources: dict[str, Resource] = {}
         self.items: dict[str, QTreeWidgetItem] = {}
         self.checked: set[str] = set()
         self.statuses: dict[str, str] = {}
+        self._downloaded: dict[str, ExistingDownload] = {}
+        self._output_cache_text: str | None = None
+        self._output_cache_path = ""
+        self._download_output_root = ""
+        self._active_download_output_root = ""
+        self._history_auto_enabled = False
+        self._history_generation = 0
+        self._history_pending = False
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.setInterval(250)
+        self._history_timer.timeout.connect(self.refresh_download_history)
         self._busy = ""
         self._closing = False
         self._download_total = 0
@@ -446,6 +545,7 @@ class ExporterApp(QMainWindow):
         self._finished_downloads: set[str] = set()
         self._resource_progress: dict[str, tuple[int, int]] = {}
         self._pending_status_updates: set[str] = set()
+        self._selection_update_pending = False
         self._download_update_timer = QTimer(self)
         self._download_update_timer.setSingleShot(True)
         self._download_update_timer.setInterval(50)
@@ -466,6 +566,7 @@ class ExporterApp(QMainWindow):
         self.name_filter.textChanged.connect(self._render)
         self.type_filter.currentTextChanged.connect(self._type_filter_changed)
         self.course_filter.currentTextChanged.connect(self._course_filter_changed)
+        self.output_dir.textChanged.connect(self._output_changed)
         self.scope_tabs.currentChanged.connect(self._scope_tab_changed)
         self.kind_tabs.currentChanged.connect(self._kind_tab_changed)
         self.tree.itemChanged.connect(self._item_changed)
@@ -476,6 +577,8 @@ class ExporterApp(QMainWindow):
         self._message("发现条目不代表可下载；实际导出会校验长度、缓存完整性或回放流。")
         self._rebuild_scope_tabs()
         self._render()
+        if self._startup_detection_enabled:
+            self._startup_timer.start(0)
 
     def _button(self, text: str, callback: Callable[[], None], primary: bool = False) -> QPushButton:
         button = QPushButton(text)
@@ -489,6 +592,10 @@ class ExporterApp(QMainWindow):
 
     def _build(self) -> None:
         build_workspace(self, PROJECT_ROOT, KIND_LABELS)
+        self.bulk_all_button.setToolTip("全选当前列表中尚未下载的资源；跳过已下载内容和权限候选")
+        self.bulk_all_button.setAccessibleName("全选当前尚未下载的可下载资源")
+        self.header_check.setToolTip("全选或取消当前尚未下载的资源")
+        self.header_check.setAccessibleName("全选或取消当前尚未下载的可下载资源")
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.tree and event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
@@ -515,6 +622,12 @@ class ExporterApp(QMainWindow):
             if not compact:
                 self.navigation_panel.show()
                 self.navigation_toggle_button.setText("收起课程")
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.ActivationChange and self.isActiveWindow()
+                and getattr(self, "_history_auto_enabled", False)):
+            self._schedule_history_refresh()
 
     def show_settings(self) -> None:
         self.settings_dialog.show()
@@ -582,13 +695,16 @@ class ExporterApp(QMainWindow):
             self.detail_name.setText("选择资源查看完整名称")
             self.detail_meta.clear()
             return
-        status = self.statuses.get(resource.id, initial_resource_status(resource))
+        status = self._resource_status(resource)
         name = readable_text(resource.name, 4096)
         self.detail_name.setText(name)
         self.detail_name.setToolTip(name)
         course = readable_text(resource.course or "未归属", 4096)
         source = SOURCE_LABELS.get(resource.source, "发现的资源")
-        qualification = "不可下载" if not selectable_resource(resource) else "优先下载远程原件"
+        qualification = ("全选与批量下载时跳过" if resource.id in self._downloaded else
+                         "不可下载" if not selectable_resource(resource) else
+                         "优先下载远程原件" if download_source_label(resource, "remote") == "远程原件" else
+                         "下载可用播放资源")
         detail = f"{course} / {source} {resource_size_label(resource)} {status} {qualification}"
         self.detail_meta.setText(detail)
         self.detail_meta.setToolTip(detail)
@@ -618,8 +734,11 @@ class ExporterApp(QMainWindow):
             self.resource_detail_text.setReadOnly(True)
             layout.addWidget(self.resource_detail_text, 1)
             layout.addWidget(self._button("关闭", self.resource_dialog.hide), 0, Qt.AlignmentFlag.AlignRight)
-        status = self.statuses.get(resource.id, initial_resource_status(resource))
-        qualification = "不可下载；仅为权限或资源候选。" if not selectable_resource(resource) else "优先下载远程原件；失败后核验完整缓存。"
+        status = self._resource_status(resource)
+        qualification = ("全选和批量下载会跳过此资源。" if resource.id in self._downloaded else
+                         "不可下载；仅为权限或资源候选。" if not selectable_resource(resource) else
+                         "优先下载远程原件；失败后核验完整缓存。" if download_source_label(resource, "remote") == "远程原件" else
+                         "下载可用播放资源；失败后核验完整缓存。")
         self.resource_detail_text.setPlainText(
             readable_text(resource.name, 4096) + "\n\n" +
             f"类型：{kind_label(resource)}\n" +
@@ -650,6 +769,67 @@ class ExporterApp(QMainWindow):
         if path:
             self.output_dir.setText(path)
 
+    def _output_path(self) -> str:
+        output = self.output_dir.text().strip()
+        if output == self._output_cache_text:
+            return self._output_cache_path
+        self._output_cache_text = output
+        self._output_cache_path = ""
+        if not output:
+            return ""
+        try:
+            self._output_cache_path = str(Path(output).expanduser().resolve())
+        except (OSError, ValueError, RuntimeError):
+            pass
+        return self._output_cache_path
+
+    @Slot()
+    def _output_changed(self) -> None:
+        self._history_generation += 1
+        self._download_output_root = self._output_path()
+        self._clear_downloaded()
+        self._render()
+        self._schedule_history_refresh()
+
+    def _clear_downloaded(self) -> None:
+        for resource_id in self._downloaded:
+            if self.statuses.get(resource_id, "").startswith("已下载"):
+                self.statuses.pop(resource_id, None)
+        self._downloaded.clear()
+
+    def _schedule_history_refresh(self) -> None:
+        if self._history_auto_enabled and self.resources and not self._closing:
+            self._history_pending = True
+            self._history_timer.start()
+
+    @Slot()
+    def refresh_download_history(self) -> None:
+        self._history_timer.stop()
+        if not self._history_auto_enabled or not self.resources or self._closing:
+            self._history_pending = False
+            return
+        if self._busy or self.worker.running:
+            self._history_pending = True
+            return
+        self._history_pending = False
+        output = self._output_path()
+        if not output:
+            return
+        if self.worker.start_history(list(self.resources.values()), output, self._history_generation):
+            self._set_busy("history")
+            self.progress_text.setText("正在检查已下载内容…")
+            self._set_progress(None)
+
+    def _can_download(self, resource: Resource) -> bool:
+        return selectable_resource(resource) and resource.id not in self._downloaded
+
+    def _resource_status(self, resource: Resource) -> str:
+        existing = self._downloaded.get(resource.id)
+        if existing is not None:
+            suffix = download_source_label(resource, existing.source)
+            return f"已下载 · {suffix}"
+        return self.statuses.get(resource.id, initial_resource_status(resource))
+
     def _open_output(self) -> None:
         output = self.output_dir.text().strip()
         if not output:
@@ -671,9 +851,27 @@ class ExporterApp(QMainWindow):
             QMessageBox.warning(self, "导出目录", "无法打开该目录。")
 
     @Slot()
+    def detect_login(self) -> None:
+        self._startup_timer.stop()
+        if not self._startup_detection_enabled or self._closing or self._busy or self.worker.running:
+            return
+        self._startup_detection_enabled = False
+        if self.worker.start_detect(self.install_dir.text().strip() or None):
+            self._set_busy("detect")
+            self.session_text.setToolTip("")
+            self.session_text.setText("正在检测 ClassIn 登录状态…")
+            self.progress_text.setText("正在读取当前客户端的登录状态…")
+            self._set_progress(None)
+
+    @Slot()
     def scan(self) -> None:
+        self._startup_timer.stop()
+        self._startup_detection_enabled = False
         if not self._busy and self.worker.start_scan(self.install_dir.text().strip() or None, self.scan_threads.value()):
+            self._history_timer.stop()
+            self._history_pending = False
             self._set_busy("scan")
+            self.session_text.setToolTip("")
             self.session_text.setText("正在检测 ClassIn 和当前登录会话…")
             self.progress_text.setText("正在扫描资源元数据，请稍候…")
             self._set_progress(None)
@@ -693,7 +891,7 @@ class ExporterApp(QMainWindow):
         if self._busy:
             return
         resources = [resource for resource_id, resource in self.resources.items()
-                     if resource_id in self.checked and selectable_resource(resource)]
+                     if resource_id in self.checked and self._can_download(resource)]
         output = self.output_dir.text().strip()
         if not resources:
             return
@@ -713,6 +911,9 @@ class ExporterApp(QMainWindow):
         self._pending_status_updates.clear()
         if self.worker.start_download(resources, output_path, self.download_threads.value(),
                                       resource_snapshot=list(self.resources.values())):
+            self._history_timer.stop()
+            self._history_pending = False
+            self._active_download_output_root = output_path
             for resource in resources:
                 self.statuses[resource.id] = "等待下载"
                 self._queue_download_update(resource.id)
@@ -721,10 +922,15 @@ class ExporterApp(QMainWindow):
 
     @Slot()
     def cancel(self) -> None:
-        if self._busy == "download":
+        if self._busy in {"download", "history", "detect"}:
+            if self._busy == "history":
+                self._history_pending = False
+                self._history_timer.stop()
             self.worker.cancel()
             self.cancel_button.setEnabled(False)
-            self.progress_text.setText("正在取消，等待当前请求结束并清理未完成文件…")
+            self.progress_text.setText("正在取消登录检测…" if self._busy == "detect" else
+                                      "正在取消检查…" if self._busy == "history" else
+                                      "正在取消，等待当前请求结束并清理未完成文件…")
 
     def _set_busy(self, operation: str) -> None:
         self._busy = operation
@@ -734,8 +940,10 @@ class ExporterApp(QMainWindow):
         self.scan_threads.setEnabled(not operation and not self._closing)
         self.download_threads.setEnabled(not operation and not self._closing)
         self.settings_button.setEnabled(not self._closing)
-        self.cancel_button.setEnabled(operation == "download" and not self._closing)
-        self.action_stack.setCurrentIndex(1 if operation == "download" else 0)
+        self.cancel_button.setEnabled(operation in {"download", "history", "detect"} and not self._closing)
+        self.cancel_button.setText("取消检测" if operation == "detect" else "取消检查" if operation == "history" else "取消下载")
+        self.cancel_button.setAccessibleName(self.cancel_button.text())
+        self.action_stack.setCurrentIndex(1 if operation in {"download", "history", "detect"} else 0)
         self.progress_bar.setVisible(bool(operation))
         self.scan_button.setText("正在获取…" if operation == "scan" else "获取资源")
         self._update_summary()
@@ -868,14 +1076,8 @@ class ExporterApp(QMainWindow):
                     item = QTreeWidgetItem(self.tree)
                     item.setData(0, Qt.ItemDataRole.UserRole, resource_id)
                     self.items[resource_id] = item
-                selectable = selectable_resource(resource)
-                if selectable:
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                else:
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                if not self._can_download(resource):
                     self.checked.discard(resource_id)
-                item.setData(0, Qt.ItemDataRole.UserRole + 3, not selectable)
-                item.setCheckState(0, Qt.CheckState.Checked if resource_id in self.checked else Qt.CheckState.Unchecked)
                 name = readable_text(resource.name, 4096)
                 course = readable_text(resource.course or "未归属", 4096)
                 source = SOURCE_LABELS.get(resource.source, "发现的资源")
@@ -918,7 +1120,7 @@ class ExporterApp(QMainWindow):
         item = self.items.get(resource_id)
         if resource is None or item is None:
             return
-        status = self.statuses.get(resource_id, initial_resource_status(resource))
+        status = self._resource_status(resource)
         display_status = status
         if not selectable_resource(resource) and "809" in status:
             display_status = "权限不足（809）\n录像未确认"
@@ -926,9 +1128,25 @@ class ExporterApp(QMainWindow):
             display_status = "缓存完整性未确认"
         elif resource_id not in self.statuses and status.startswith("完整缓存"):
             display_status = "完整缓存"
-        # Download events do not change names, filters or selection. Updating
-        # just this row keeps concurrent progress from rebuilding the table.
+        # Completion can remove a checkbox without rebuilding names, filters or
+        # other rows. Concurrent progress remains bounded by the update timer.
         with QSignalBlocker(self.tree):
+            selectable = self._can_download(resource)
+            downloaded = resource_id in self._downloaded
+            selected = selectable and resource_id in self.checked
+            selection_state = int(selectable) | int(selected) * 2 | int(downloaded) * 4
+            # Progress does not change checkbox semantics. Apply native flags
+            # and accessibility only when selection or qualification changes.
+            if item.data(0, Qt.ItemDataRole.UserRole + 4) != selection_state:
+                item.setFlags((item.flags() | Qt.ItemFlag.ItemIsUserCheckable) if selectable else
+                              (item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable))
+                item.setData(0, Qt.ItemDataRole.UserRole + 3, not selectable)
+                item.setCheckState(0, Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked)
+                item.setToolTip(0, "已下载，全选和批量下载时跳过" if downloaded else
+                                "勾选此资源" if selectable else "此资源不可下载")
+                item.setData(0, Qt.ItemDataRole.AccessibleTextRole,
+                             "已下载，不可勾选" if downloaded else "可勾选下载" if selectable else "不可下载")
+                item.setData(0, Qt.ItemDataRole.UserRole + 4, selection_state)
             item.setText(6, status)
             item.setToolTip(6, status)
             item.setForeground(6, QColor(TOKENS["text"]))
@@ -940,7 +1158,7 @@ class ExporterApp(QMainWindow):
 
     def _update_summary(self) -> None:
         visible_ids = {resource_id for resource_id, item in self.items.items() if not item.isHidden()}
-        selected = {key for key in self.checked if key in self.resources and selectable_resource(self.resources[key])}
+        selected = {key for key in self.checked if key in self.resources and self._can_download(self.resources[key])}
         hidden = len(selected - visible_ids)
         summary = f"显示 {len(visible_ids)} / {len(self.resources)} 项  已勾选 {len(selected)} 项"
         if hidden:
@@ -948,11 +1166,11 @@ class ExporterApp(QMainWindow):
         self.summary_text.setText(summary)
         self.visible_text.setText(f"显示 {len(visible_ids)} / {len(self.resources)} 项" if self._has_loaded else "尚未获取资源")
         self.selection_text.setText(f"已选 {len(selected)} 项 · 隐藏 {hidden} 项")
-        self.selection_text.setAccessibleName(f"已选 {len(selected)} 项，其中隐藏 {hidden} 项；下载包含全部已选项目")
+        self.selection_text.setAccessibleName(f"已选 {len(selected)} 项，其中隐藏 {hidden} 项；下载包含全部已选项目，跳过已下载内容")
         self.download_button.setText(f"下载已选 {len(selected)} 项")
-        self.download_button.setAccessibleName(f"下载全部已选 {len(selected)} 项，包括隐藏 {hidden} 项")
+        self.download_button.setAccessibleName(f"下载全部已选 {len(selected)} 项，包括隐藏 {hidden} 项；已下载内容会跳过")
         self.download_button.setEnabled(bool(selected) and not self._busy and not self._closing)
-        selectable_ids = {key for key in visible_ids if selectable_resource(self.resources[key])}
+        selectable_ids = {key for key in visible_ids if self._can_download(self.resources[key])}
         for button in (self.bulk_all_button, self.bulk_none_button, self.bulk_invert_button):
             button.setEnabled(bool(selectable_ids))
         with QSignalBlocker(self.header_check):
@@ -965,7 +1183,7 @@ class ExporterApp(QMainWindow):
     def _item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if column == 0:
             resource_id = item.data(0, Qt.ItemDataRole.UserRole)
-            if not selectable_resource(self.resources[resource_id]):
+            if not self._can_download(self.resources[resource_id]):
                 self.checked.discard(resource_id)
                 with QSignalBlocker(self.tree):
                     item.setCheckState(0, Qt.CheckState.Unchecked)
@@ -983,12 +1201,12 @@ class ExporterApp(QMainWindow):
     @Slot()
     def _space_toggle(self) -> None:
         for item in self.tree.selectedItems():
-            if not selectable_resource(self.resources[item.data(0, Qt.ItemDataRole.UserRole)]):
+            if not self._can_download(self.resources[item.data(0, Qt.ItemDataRole.UserRole)]):
                 continue
             item.setCheckState(0, Qt.CheckState.Unchecked if item.checkState(0) == Qt.CheckState.Checked else Qt.CheckState.Checked)
 
     def _bulk_check(self, mode: str) -> None:
-        ids = {resource.id for resource in self._visible() if selectable_resource(resource)}
+        ids = {resource.id for resource in self._visible() if self._can_download(resource)}
         if mode == "all":
             self.checked.update(ids)
         elif mode == "none":
@@ -998,6 +1216,9 @@ class ExporterApp(QMainWindow):
         self._render()
 
     def _load_resources(self, resources: list[Resource], replace: bool) -> None:
+        self._startup_timer.stop()
+        self._startup_detection_enabled = False
+        self._history_generation += 1
         self._has_loaded = True
         self._scan_failed = False
         if replace:
@@ -1005,11 +1226,16 @@ class ExporterApp(QMainWindow):
             self.items.clear()
             self.checked.clear()
             self.statuses.clear()
+            self._downloaded.clear()
             self.tree.clear()
         for resource in resources:
+            if resource.id in self._downloaded:
+                self._downloaded.pop(resource.id)
+                self.statuses.pop(resource.id, None)
             self.resources[resource.id] = resource
         self._rebuild_scope_tabs()
         self._render()
+        self._schedule_history_refresh()
 
     def _download_summary(self) -> None:
         if self._download_total <= 0:
@@ -1036,23 +1262,59 @@ class ExporterApp(QMainWindow):
         self._pending_status_updates = set()
         for resource_id in pending:
             self._update_resource_status(resource_id)
+        if self._selection_update_pending:
+            self._selection_update_pending = False
+            self._update_summary()
         self._download_summary()
 
     @Slot(object)
     def _handle_event(self, event: WorkerEvent) -> None:
         data, kind = event.data, event.kind
-        if kind == "scan_finished":
+        if kind == "login_detected":
+            self.session_text.setText("已检测到 ClassIn 登录")
+            self.session_text.setToolTip("")
+            self.progress_text.setText("登录状态已确认，点击“获取资源”开始整理课程资料。")
+        elif kind == "login_failed":
+            self.session_text.setText("未检测到有效 ClassIn 登录")
+            self.session_text.setToolTip(data["message"])
+            self.progress_text.setText(data["message"])
+            self._message(data["message"])
+        elif kind == "login_cancelled":
+            self.session_text.setText("已取消登录检测")
+            self.progress_text.setText("已取消登录检测；登录 ClassIn 后可点击“获取资源”。")
+        elif kind == "scan_finished":
             result: ScanResult = data["result"]
+            self._history_auto_enabled = True
             self._set_scan_warnings(result.warnings)
             self._load_resources(result.resources, replace=True)
             self.session_text.setText(readable_text(result.session_status or "扫描完成"))
+            self.session_text.setToolTip("")
             self.progress_text.setText(f"扫描完成，发现 {len(result.resources)} 个资源。")
             self._message("\n".join(result.warnings) if result.warnings else "扫描完成。下载时会刷新资源地址。", replace=True)
         elif kind == "import_finished":
             resources = data["resources"]
+            self._history_auto_enabled = True
             self._load_resources(resources, replace=False)
             self.progress_text.setText(f"已导入 {len(resources)} 个资源，当前共 {len(self.resources)} 项。")
             self._message("已补充导入Json Manifest")
+        elif kind == "history_finished":
+            if (data["generation"] != self._history_generation or data["output_dir"] != self._output_path()):
+                return
+            self._clear_downloaded()
+            self._downloaded = {resource_id: existing for resource_id, existing in data["downloaded"].items()
+                                if resource_id in self.resources and selectable_resource(self.resources[resource_id])}
+            self._download_output_root = data["output_dir"]
+            self.checked.difference_update(self._downloaded)
+            for resource_id in self._downloaded:
+                self.statuses[resource_id] = self._resource_status(self.resources[resource_id])
+            self._render()
+            self.progress_text.setText(f"已检查 {len(self.resources)} 项，已下载 {len(self._downloaded)} 项；全选会跳过。")
+            warnings = {existing.warning for existing in self._downloaded.values() if existing.warning}
+            for warning in sorted(warnings):
+                self._message(warning)
+        elif kind == "history_cancelled":
+            if data["generation"] == self._history_generation:
+                self.progress_text.setText("已取消检查；下载前仍会核验已有文件。")
         elif kind == "failed":
             self._flush_download_updates()
             self.progress_text.setText(data["message"])
@@ -1061,6 +1323,8 @@ class ExporterApp(QMainWindow):
                 self._scan_failed = True
                 self._set_scan_warnings([data["message"]])
                 self._render()
+            elif data["operation"] == "detect":
+                self.session_text.setText("登录检测未完成")
             self._message(data["message"])
         elif kind == "download_started":
             resource_id = data["resource_id"]
@@ -1087,12 +1351,23 @@ class ExporterApp(QMainWindow):
             self._message(f"{readable_text(self.resources[resource_id].name, 100)}：{data['message']}")
         elif kind == "download_finished":
             download_result: DownloadResult = data["result"]
-            self._active_downloads.discard(data["resource_id"])
-            self._finished_downloads.add(data["resource_id"])
-            suffix = "远程原件" if download_result.source == "remote" else "完整缓存"
-            self.statuses[data["resource_id"]] = f"已导出 · {suffix}"
-            self._message(f"已导出：{Path(download_result.path).name}（{format_size(download_result.bytes_written)}，{suffix}）")
-            self._queue_download_update(data["resource_id"])
+            resource_id = data["resource_id"]
+            self._active_downloads.discard(resource_id)
+            self._finished_downloads.add(resource_id)
+            suffix = download_source_label(self.resources.get(resource_id), download_result.source)
+            if self._active_download_output_root == self._output_path():
+                self._download_output_root = self._active_download_output_root
+                self._downloaded[resource_id] = ExistingDownload(download_result.path, download_result.bytes_written,
+                                                               download_result.sha256, download_result.source,
+                                                               download_result.warning)
+                self.statuses[resource_id] = f"已下载 · {suffix}"
+                self.checked.discard(resource_id)
+                self._selection_update_pending = True
+            self._message(f"{'已下载，跳过' if download_result.skipped else '已下载'}：{Path(download_result.path).name}"
+                          f"（{format_size(download_result.bytes_written)}，{suffix}）")
+            if download_result.warning:
+                self._message(download_result.warning)
+            self._queue_download_update(resource_id)
         elif kind == "download_cancelled":
             self._active_downloads.discard(data["resource_id"])
             self._finished_downloads.add(data["resource_id"])
@@ -1106,6 +1381,8 @@ class ExporterApp(QMainWindow):
             # Flush before the final summary so the timer cannot overwrite it.
             self._flush_download_updates()
             text = f"{'下载已取消' if data['cancelled'] else '批量下载结束'}：成功 {data['completed']} 项，失败 {data['failed']} 项"
+            if data.get("skipped", 0):
+                text += f"，已下载跳过 {data['skipped']} 项"
             if data["cancelled"]:
                 text += f"，取消或未开始 {data['remaining']} 项"
             self.progress_text.setText(text + "。")
@@ -1116,8 +1393,14 @@ class ExporterApp(QMainWindow):
             self._set_busy("")
             if self._closing:
                 self.close()
+            elif self._history_pending:
+                self._history_timer.start(0)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._startup_timer.stop()
+        self._startup_detection_enabled = False
+        self._history_timer.stop()
+        self._history_pending = False
         if self.worker.running:
             event.ignore()
             self._closing = True

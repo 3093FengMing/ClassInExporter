@@ -31,3 +31,5 @@ class DownloadResult:
     source: str
     bytes_written: int
     sha256: str
+    skipped: bool = False
+    warning: str = ""

@@ -10,7 +10,7 @@
 
 ### 使用 Windows 打包版
 
-打包版可按下方构建说明在本地构建。将生成的 `ClassInExporter-0.4.1-win64.zip` 解压后运行 `ClassInExporter/ClassInExporter.exe`。默认导出到同目录下的 `exports`。
+打包版可按下方构建说明在本地构建。将生成的 `ClassInExporter-0.4.2-win64.zip` 解压后运行 `ClassInExporter/ClassInExporter.exe`。默认导出到同目录下的 `exports`。
 
 ### 从源码运行
 
@@ -27,9 +27,9 @@ py -3.11 -m venv .venv
 ## 使用方法
 
 1. 打开 ClassIn 客户端，并登录需要导出资源的账号。
-2. 打开 ClassInExporter，点击“获取资源”。
-3. 在左侧选择课程 / 云盘，选择要获取的对应资源。
-4. 点击“下载已选”批量下载。导出目录使用课程名称，同名课程或文件用编号区分。
+2. 打开 ClassInExporter，等待后台登录检测完成，点击“获取资源”。
+3. 在左侧选择课程 / 云盘，勾选需要下载的资源。
+4. 点击“下载已选”批量下载。
 
 ## 分析结论与开发入口
 
@@ -40,11 +40,11 @@ py -3.11 -m venv .venv
              → 统一资源模型 → 原件地址刷新 → 下载及完整性验证
 ```
 
-- `classin_exporter/session.py`：当前会话读取、服务域名、签名、登录一致性与线程 transport。
+- `classin_exporter/session.py`：按安装文件的导出与 getter 指令特征定位当前会话，处理服务域名、签名、登录一致性与线程 transport。
 - `classin_exporter/discovery.py`：课程、云盘、活动分页及资源聚合。
 - `classin_exporter/lms_material.py`、`lms_record.py`、`lms_homework.py`：资料、录播与作业附件适配。
 - `classin_exporter/resources.py`、`grouping.py`：统一资源结构、稳定标识及输出目录。
-- `classin_exporter/downloader.py`、`cache.py`：远程原件、标准 HLS、Qt 缓存完整性及取消清理。
+- `classin_exporter/downloader.py`、`cache.py`、`download_history.py`：远程原件、标准 HLS、Qt 缓存完整性、已下载记录及取消清理。
 - `classin_exporter/gui.py`、`gui_workspace.py`、`gui_views.py`：后台调度与中文 Qt 课程目录界面。
 
 详细的复现步骤、认证和签名规则、API 请求字段、响应结构、分页及验证边界见 [API.md](API.md)。

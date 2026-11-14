@@ -23,6 +23,7 @@ from urllib.parse import urljoin, urlsplit
 import requests
 
 from .resources import DownloadResult, Resource
+from .download_history import download_lock, lookup_download, record_download
 
 
 Progress = Callable[[int, int], None]
@@ -124,7 +125,17 @@ class DownloadManager:
 
     def download(self, resource: Resource, progress: Progress | None = None,
                  cancel: threading.Event | None = None) -> DownloadResult:
+        with download_lock(resource, self.output_dir, cancel):
+            return self._download_once(resource, progress, cancel)
+
+    def _download_once(self, resource: Resource, progress: Progress | None,
+                       cancel: threading.Event | None) -> DownloadResult:
         _check_cancel(cancel)
+        existing = lookup_download(resource, self.output_dir, verify_changed=True,
+                                   recover_legacy=True, cancel=cancel)
+        if existing is not None:
+            return DownloadResult(resource.id, existing.path, existing.source, existing.bytes_written,
+                                  existing.sha256, skipped=True, warning=existing.warning)
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -232,7 +243,9 @@ class DownloadManager:
             except OSError:
                 raise DownloadError("无法完成导出，请检查目录权限或磁盘空间。") from None
             partial.unlink(missing_ok=True)
-            return DownloadResult(resource.id, str(candidate), source, size, digest)
+            result = DownloadResult(resource.id, str(candidate), source, size, digest)
+            result.warning = record_download(resource, result)
+            return result
         raise DownloadError("同名文件过多，请更换导出目录或资源名称。")
 
     def _download_remote(self, resource: Resource, progress: Progress | None,

@@ -29,7 +29,7 @@ os.environ["PATH"] = os.pathsep.join(
 )
 version_info = VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(0, 4, 1, 0), prodvers=(0, 4, 1, 0),
+        filevers=(0, 4, 2, 0), prodvers=(0, 4, 2, 0),
         mask=0x3F, flags=0, OS=0x40004, fileType=0x1, subtype=0,
         date=(0, 0),
     ),
@@ -37,11 +37,11 @@ version_info = VSVersionInfo(
         StringFileInfo([
             StringTable("040904B0", [
                 StringStruct("FileDescription", "ClassInExporter"),
-                StringStruct("FileVersion", "0.4.1"),
+                StringStruct("FileVersion", "0.4.2"),
                 StringStruct("InternalName", "ClassInExporter"),
                 StringStruct("OriginalFilename", "ClassInExporter.exe"),
                 StringStruct("ProductName", "ClassInExporter"),
-                StringStruct("ProductVersion", "0.4.1"),
+                StringStruct("ProductVersion", "0.4.2"),
             ]),
         ]),
         VarFileInfo([VarStruct("Translation", [1033, 1200])]),

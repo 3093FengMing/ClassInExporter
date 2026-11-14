@@ -605,16 +605,26 @@ class _NativeSource:
         self.core_image_base = _pe_header_int(self.core_pe, "OPTIONAL_HEADER", "ImageBase")
         self.base_image_base = _pe_header_int(self.base_pe, "OPTIONAL_HEADER", "ImageBase")
         self.core_global = self._returned_global(self.core_pe, self._export(self.core_pe, "?instance@CoreEngine"), "mov")
-        base_token = self._code(self.base_pe, self._export(self.base_pe, "?token@EeoNetworkConfig"))
-        calls = self._direct_calls(base_token)
-        if len(calls) < 2:
-            raise SessionError("暂不支持当前 ClassIn 令牌结构。")
-        self.token_global = self._returned_global(self.base_pe, calls[0], "lea")
-        self.token_offset = self._add_rax(self._code(self.base_pe, calls[1]))
+        # Only the verified legacy TokenState getter permits reading its
+        # adjacent fields. Newer clients omit it: obtain an API token through
+        # tokenExchange instead of searching memory for token-looking text.
+        token_export = self._optional_export(self.base_pe, "?token@EeoNetworkConfig")
+        self.token_global = None
+        self.device_map_global = None
+        if token_export is not None:
+            calls = self._direct_calls(self._code(self.base_pe, token_export), self.base_pe)
+            if len(calls) < 2:
+                raise SessionError("暂不支持当前 ClassIn 令牌结构。")
+            self.token_global = self._returned_global(self.base_pe, calls[0], "lea")
+            if self._add_rax(self._code(self.base_pe, calls[1])) != 80:
+                raise SessionError("暂不支持当前 ClassIn 版本令牌结构。")
+        else:
+            map_code = self._code(self.base_pe, self._export(self.base_pe, "?getDeviceMap@EeoBaseUtils"), 4096)
+            self.device_map_global = self._qstring_global(self.base_pe, map_code)
         machine_code = self._code(self.base_pe, self._export(self.base_pe, "?getMachineUniqueFlag@EeoBaseUtils"), 4096)
         # The final RIP-relative LEA passed to the QString copy constructor is
         # the cached device identifier returned by this exported getter.
-        self.device_global = self._rip_lea_rdx(machine_code)[-1]
+        self.device_global = self._qstring_global(self.base_pe, machine_code)
         self.cache_global = self._cache_directory_global()
         core_base = modules["eeocoreengine.dll"][0]
         reader = _Reader(api, pid)
@@ -624,47 +634,55 @@ class _NativeSource:
                 raise SessionError("ClassIn 尚未建立登录对象，请登录后重试。")
             table = reader.qword(core)
             uid_code = self._vcode(reader, table, 240)
-            self.uid_offset = self._rax_deref(uid_code)[-1]
-            self.secret_offset = self._add_rax(self._vcode(reader, table, 352))
-            self.telephone_offset = self._add_rax(self._vcode(reader, table, 296))
+            self.uid_offset = self._single_offset(self._rax_deref(uid_code))
+            self.secret_offset = self._qstring_field_offset(self.core_pe, self._vcode(reader, table, 352))
+            self.telephone_offset = self._qstring_field_offset(self.core_pe, self._vcode(reader, table, 296))
             dynamic_code = self._vcode(reader, table, 168)
             # CoreEngine's current static URL callback forwards to the named
             # LoginObject getter. Slot 176 is a reserve CDN *name*, not a URL.
             static_code = self._vcode(reader, table, 152)
-            self.config_offset = self._rax_deref(dynamic_code)[-1]
-            if self._rax_deref(static_code)[-1] != self.config_offset:
+            self.config_offset = self._single_offset(self._rax_deref(dynamic_code))
+            if self._single_offset(self._rax_deref(static_code)) != self.config_offset:
                 raise SessionError("暂不支持当前 ClassIn 服务配置结构。")
-            dynamic_inner = self._code(self.core_pe, self._direct_calls(dynamic_code)[0])
-            static_target = self._direct_calls(static_code)[0]
-            if static_target != self._export(self.core_pe, "?cdnStaticUrl@LoginObject"):
+            dynamic_calls = self._direct_calls(dynamic_code)
+            static_calls = self._direct_calls(static_code)
+            if (dynamic_calls != [self._export(self.core_pe, "?cdnDynamicUrl@LoginObject")]
+                    or static_calls != [self._export(self.core_pe, "?cdnStaticUrl@LoginObject")]):
                 raise SessionError("暂不支持当前 ClassIn 下载服务结构。")
-            static_inner = self._code(self.core_pe, static_target)
-            self.settings_offset = self._rax_deref(dynamic_inner)[-1]
-            if self._rax_deref(static_inner)[-1] != self.settings_offset:
-                raise SessionError("暂不支持当前 ClassIn 服务配置结构。")
-            self.dynamic_offset, self.static_offset = self._add_rax(dynamic_inner), self._add_rax(static_inner)
-            login_code = self._code(self.core_pe, self._direct_calls(uid_code)[0])
+            dynamic_inner = self._code(self.core_pe, dynamic_calls[0])
+            static_inner = self._code(self.core_pe, static_calls[0])
+            login_target = self._export(self.core_pe, "?isLogined@LoginObject")
+            if self._direct_calls(uid_code) != [login_target]:
+                raise SessionError("暂不支持当前 ClassIn 版本登录状态结构。")
+            login_code = self._code(self.core_pe, login_target)
+            self.settings_offset = self._single_offset(self._rax_deref(login_code))
             self.login_offset = self._byte_rax_deref(login_code)
-            if self._rax_deref(login_code)[-1] != self.settings_offset:
+            if self._single_offset(self._rax_deref(self._vcode(reader, table, 88))) != self.config_offset:
                 raise SessionError("暂不支持当前 ClassIn 版本登录状态结构。")
-            if self._rax_deref(self._vcode(reader, table, 88))[-1] != self.config_offset:
-                raise SessionError("暂不支持当前 ClassIn 版本登录状态结构。")
+            self._configure_cdn(dynamic_inner, static_inner)
         finally:
             reader.close()
-        # State offsets and the adjacent device-map cache are checked against
-        # verified native EeoNetworkConfig::TokenState layout.
-        if self.token_offset != 80:
-            raise SessionError("暂不支持当前 ClassIn 版本令牌结构。")
 
     def _export(self, pe: Any, prefix: str) -> int:
-        candidates = [x.address for x in pe.DIRECTORY_ENTRY_EXPORT.symbols if (x.name or b"").decode().startswith(prefix)]
-        if len(candidates) != 1:
+        target = self._optional_export(pe, prefix)
+        if target is None:
             raise SessionError("暂不支持当前 ClassIn 客户端结构。")
-        return candidates[0]
+        return target
+
+    def _optional_export(self, pe: Any, prefix: str) -> int | None:
+        entries = getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", [])
+        candidates = [item for item in entries if (item.name or b"").decode().startswith(prefix)]
+        if len(candidates) > 1 or any(getattr(item, "forwarder", None) for item in candidates):
+            raise SessionError("暂不支持当前 ClassIn 客户端导出结构。")
+        return candidates[0].address if candidates else None
 
     def _code(self, pe: Any, rva: int, size: int = 2048) -> list[Any]:
         result = []
         image_base = _pe_header_int(pe, "OPTIONAL_HEADER", "ImageBase")
+
+        section = pe.get_section_by_rva(rva)
+        if section is None or not section.Characteristics & 0x20000000:
+            raise SessionError("暂不支持当前 ClassIn 客户端函数结构。")
         for ins in self.md.disasm(pe.get_data(rva, size), image_base + rva):
             result.append(ins)
             if ins.mnemonic == "ret":
@@ -691,21 +709,273 @@ class _NativeSource:
     @staticmethod
     def _add_rax(code: list[Any]) -> int:
         import capstone.x86 as x
-        values = [i.operands[1].imm for i in code if i.mnemonic == "add" and len(i.operands) == 2
+        values = sorted({i.operands[1].imm for i in code if i.mnemonic == "add" and len(i.operands) == 2
                   and i.operands[0].type == x.X86_OP_REG and i.operands[0].reg == x.X86_REG_RAX
-                  and i.operands[1].type == x.X86_OP_IMM]
-        if len(values) != 1 or not 0 < values[0] < 4096:
-            raise SessionError("暂不支持当前 ClassIn 登录字段结构。")
-        return values[0]
+                  and i.operands[1].type == x.X86_OP_IMM})
+        return _NativeSource._single_offset(values)
 
-    def _direct_calls(self, code: list[Any]) -> list[int]:
+    def _direct_calls(self, code: list[Any], pe: Any = None) -> list[int]:
         import capstone.x86 as x
-        # Both supported ClassIn DLLs use this preferred image base; runtime
-        # addresses are translated separately through the module inventory.
-        if self.core_image_base != self.base_image_base:
-            raise SessionError("暂不支持当前 ClassIn 客户端模块结构。")
-        return [i.operands[0].imm - self.core_image_base
+        image = self.core_pe if pe is None else pe
+        image_base = _pe_header_int(image, "OPTIONAL_HEADER", "ImageBase")
+        targets = [i.operands[0].imm - image_base
                 for i in code if i.mnemonic == "call" and i.operands[0].type == x.X86_OP_IMM]
+        for target in targets:
+            section = image.get_section_by_rva(target)
+            if section is None or not section.Characteristics & 0x20000000:
+                raise SessionError("暂不支持当前 ClassIn 客户端调用结构。")
+        return targets
+
+    @staticmethod
+    def _single_offset(values: list[int]) -> int:
+        unique = set(values)
+        if len(unique) != 1 or not 0 < next(iter(unique)) < 4096:
+            raise SessionError("暂不支持当前 ClassIn 登录字段结构。")
+        return next(iter(unique))
+
+    @staticmethod
+    def _import_at(pe: Any, ins: Any) -> tuple[str, str] | None:
+        import capstone.x86 as x
+        if (ins.mnemonic not in {"call", "jmp"} or not ins.operands
+                or ins.operands[0].type != x.X86_OP_MEM or ins.operands[0].mem.base != x.X86_REG_RIP):
+            return None
+        target = ins.address + ins.size + ins.operands[0].mem.disp
+        for group in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+            for item in group.imports:
+                if item.address == target:
+                    return group.dll.decode().casefold(), (item.name or b"").decode()
+        return None
+
+    def _qstring_field_offset(self, pe: Any, code: list[Any], *,
+                              base: tuple = ("this",), node_target: int | None = None) -> int:
+        # Verify the source passed to the actual QString copy, including when
+        # the same field also appears in several isEmpty checks.
+        values = [source[2] for source, output in self._copy_sources(pe, code, node_target=node_target)
+                  if output == ("output",) and isinstance(source, tuple) and len(source) == 3
+                  and source[:2] == ("address", base) and isinstance(source[2], int)]
+        return self._single_offset(values)
+
+    def _copy_sources(self, pe: Any, code: list[Any], *, node_target: int | None = None) -> list[tuple[Any, Any]]:
+        """Conservatively track source and output arguments of QString copies.
+
+        Stack slots use their entry-relative position. Unknown writes/calls
+        erase expressions; a matching add alone never establishes provenance.
+        This recognizes the observed getter ABI without executing client code.
+        """
+        import capstone.x86 as x
+        registers: dict[int, Any] = {x.X86_REG_RCX: ("this",), x.X86_REG_RDX: ("output",)}
+        stack: dict[int, Any] = {}
+        strings: dict[tuple, Any] = {}
+        delta = 0
+        copies = []
+        image_base = _pe_header_int(pe, "OPTIONAL_HEADER", "ImageBase")
+
+        def write_register(register: int, value: Any = None, *, full: bool = False) -> None:
+            name = self.md.reg_name(register) or ""
+            if name in {"rsp", "esp", "sp", "spl"}:
+                raise SessionError("暂不支持当前 ClassIn 登录字段栈结构。")
+            families = {"rax": {"rax", "eax", "ax", "al", "ah"},
+                        "rcx": {"rcx", "ecx", "cx", "cl", "ch"},
+                        "rdx": {"rdx", "edx", "dx", "dl", "dh"},
+                        "rbx": {"rbx", "ebx", "bx", "bl", "bh"},
+                        "rsi": {"rsi", "esi", "si", "sil"},
+                        "rdi": {"rdi", "edi", "di", "dil"},
+                        "rbp": {"rbp", "ebp", "bp", "bpl"}}
+            canonical = next((key for key, names in families.items() if name in names), None)
+            if canonical is None and name.startswith("r") and name[1:].rstrip("dwb").isdigit():
+                canonical = "r" + name[1:].rstrip("dwb")
+            registers.pop(register, None)
+            if canonical is not None:
+                registers.pop(getattr(x, "X86_REG_" + canonical.upper()), None)
+            if full:
+                registers[register] = value
+
+        def write_stack(position: int, size: int, value: Any = None) -> None:
+            for tracked in list(stack):
+                if position < tracked + 8 and tracked < position + size:
+                    stack.pop(tracked)
+            for origin in list(strings):
+                if origin[0] == "stack" and position < origin[1] + 8 and origin[1] < position + size:
+                    strings.pop(origin)
+            if size == 8:
+                stack[position] = value
+
+        def memory(operand: Any, address: bool = False) -> Any:
+            if operand.mem.index:
+                return None
+            if operand.mem.base == x.X86_REG_RSP:
+                return ("stack", delta + operand.mem.disp) if address else stack.get(delta + operand.mem.disp)
+            if operand.mem.base == x.X86_REG_RIP:
+                return ("global", ins.address + ins.size + operand.mem.disp - image_base) if address else None
+            origin = registers.get(operand.mem.base)
+            return ("address" if address else "deref", origin, operand.mem.disp) if origin is not None else None
+
+        for ins in code:
+            operands = ins.operands
+            if ins.mnemonic == "call":
+                source, output = registers.get(x.X86_REG_RDX), registers.get(x.X86_REG_RCX)
+                is_copy = self._import_at(pe, ins) == ("qt5core.dll", "??0QString@@QEAA@AEBV0@@Z")
+                is_move = self._import_at(pe, ins) == ("qt5core.dll", "??0QString@@QEAA@$$QEAV0@@Z")
+                if is_move:
+                    source = strings.get(source) if isinstance(source, tuple) else None
+                if is_copy:
+                    copies.append((source, output))
+                elif is_move:
+                    copies.append((source, output))
+                if (is_copy or is_move) and isinstance(output, tuple):
+                    strings[output] = source
+                for register in (x.X86_REG_RAX, x.X86_REG_RCX, x.X86_REG_RDX, x.X86_REG_R8,
+                                 x.X86_REG_R9, x.X86_REG_R10, x.X86_REG_R11):
+                    registers.pop(register, None)
+                if is_copy or is_move:
+                    registers[x.X86_REG_RAX] = output
+                elif (node_target is not None and operands[0].type == x.X86_OP_IMM
+                      and operands[0].imm - image_base == node_target):
+                    registers[x.X86_REG_RAX] = ("first",)
+                continue
+            if (ins.mnemonic in {"add", "sub"} and len(operands) == 2
+                    and operands[0].type == x.X86_OP_REG and operands[0].reg == x.X86_REG_RSP):
+                if operands[1].type != x.X86_OP_IMM:
+                    raise SessionError("暂不支持当前 ClassIn 登录字段结构。")
+                delta += operands[1].imm * (1 if ins.mnemonic == "add" else -1)
+                continue
+            if ins.mnemonic == "push":
+                delta -= 8
+                write_stack(delta, 8, registers.get(operands[0].reg) if operands[0].type == x.X86_OP_REG else None)
+                continue
+            if ins.mnemonic == "pop":
+                write_register(operands[0].reg, stack.get(delta), full=operands[0].size == 8)
+                delta += 8
+                continue
+            if ins.mnemonic == "mov" and len(operands) == 2:
+                value = registers.get(operands[1].reg) if operands[1].type == x.X86_OP_REG else (
+                    memory(operands[1]) if operands[1].type == x.X86_OP_MEM else None)
+                if operands[0].type == x.X86_OP_REG:
+                    write_register(operands[0].reg, value, full=operands[0].size == 8)
+                elif operands[0].type == x.X86_OP_MEM and operands[0].mem.base == x.X86_REG_RSP:
+                    write_stack(delta + operands[0].mem.disp, operands[0].size, value)
+                continue
+            if ins.mnemonic == "lea" and len(operands) == 2 and operands[0].type == x.X86_OP_REG:
+                value = memory(operands[1], address=True)
+                write_register(operands[0].reg, value, full=operands[0].size == 8)
+                continue
+            if (ins.mnemonic == "add" and len(operands) == 2 and operands[0].type == x.X86_OP_REG
+                    and operands[1].type == x.X86_OP_IMM):
+                origin = registers.get(operands[0].reg)
+                value = ("address", origin, operands[1].imm) if origin is not None else None
+                write_register(operands[0].reg, value, full=operands[0].size == 8)
+                continue
+            # Partial-register writes invalidate their full-register origin.
+            if ins.mnemonic not in {"cmp", "test", "ret", "nop"} and not ins.mnemonic.startswith("j"):
+                if operands and operands[0].type == x.X86_OP_MEM and operands[0].mem.base == x.X86_REG_RSP:
+                    write_stack(delta + operands[0].mem.disp, operands[0].size)
+                for register in ins.regs_access()[1]:
+                    write_register(register)
+        return copies
+
+    def _qstring_global(self, pe: Any, code: list[Any]) -> int:
+        values = [source[1] for source, output in self._copy_sources(pe, code)
+                  if output == ("this",) and isinstance(source, tuple) and len(source) == 2
+                  and source[0] == "global" and isinstance(source[1], int)]
+        if not values:
+            raise SessionError("暂不支持当前 ClassIn 设备字段结构。")
+        target = values[-1]  # The final copy is the exported getter's return.
+        section = pe.get_section_by_rva(target)
+        if section is None or not section.Characteristics & 0x80000000:
+            raise SessionError("暂不支持当前 ClassIn 设备字段结构。")
+        return target
+
+    def _configure_cdn(self, dynamic: list[Any], static: list[Any]) -> None:
+        paths = self._rax_deref(dynamic), self._rax_deref(static)
+        self.cdn_manager_offset = None
+        if paths == ([self.settings_offset], [self.settings_offset]):
+            settings_base = ("deref", ("this",), self.settings_offset)
+            self.dynamic_offset = self._qstring_field_offset(self.core_pe, dynamic, base=settings_base)
+            self.static_offset = self._qstring_field_offset(self.core_pe, static, base=settings_base)
+            return
+        if (paths[0] != paths[1] or len(paths[0]) != 2 or paths[0][0] != self.settings_offset
+                or self._single_offset(paths[0][1:]) <= 0
+                or [self._import_at(self.core_pe, ins) for ins in dynamic if self._import_at(self.core_pe, ins)]
+                    != [("eeoserverproxyqt.dll", "?bestDynamic@CdnManager@qt@serverproxy@eeo@@QEBA?AVQString@@XZ")]
+                or [self._import_at(self.core_pe, ins) for ins in static if self._import_at(self.core_pe, ins)]
+                    != [("eeoserverproxyqt.dll", "?bestStatic@CdnManager@qt@serverproxy@eeo@@QEBA?AVQString@@XZ")]):
+            raise SessionError("暂不支持当前 ClassIn 服务配置结构。")
+        import pefile
+        if not {"eeoserverproxyqt.dll", "qt5core.dll"}.issubset(self.modules):
+            raise SessionError("暂不支持当前 ClassIn 服务模块结构。")
+        proxy = pefile.PE(self.modules["eeoserverproxyqt.dll"][2])
+        qt = pefile.PE(self.modules["qt5core.dll"][2])
+        if any(_pe_header_int(pe, "FILE_HEADER", "Machine") != 0x8664 for pe in (proxy, qt)):
+            raise SessionError("暂不支持当前 ClassIn 服务模块结构。")
+        self.cdn_manager_offset = paths[0][1]
+        dpath = self._cdn_node_path(proxy, "?bestDynamic@CdnManager")
+        spath = self._cdn_node_path(proxy, "?bestStatic@CdnManager")
+        if dpath[:2] != spath[:2]:
+            raise SessionError("暂不支持当前 ClassIn 服务列表结构。")
+        self.cdn_vector_offset, first = dpath[:2]
+        self.dynamic_offset, self.static_offset = dpath[2], spath[2]
+        self._verify_cdn_first(proxy, first, qt)
+
+    def _cdn_node_path(self, pe: Any, prefix: str) -> tuple[int, int, int]:
+        import capstone.x86 as x
+        code = self._code(pe, self._export(pe, prefix))
+        calls = self._direct_calls(code, pe)
+        if len(calls) != 2:
+            raise SessionError("暂不支持当前 ClassIn 服务列表结构。")
+        offsets = []
+        for index, ins in enumerate(code):
+            if ins.mnemonic == "call" and ins.operands[0].type == x.X86_OP_IMM:
+                window = code[max(0, index - 2):index]
+                if len(window) != 2 or window[1].op_str != "rcx, rax":
+                    raise SessionError("暂不支持当前 ClassIn 服务列表结构。")
+                offsets.append(self._add_rax(window[:1]))
+        vector = self._single_offset(offsets)
+        empty = self._code(pe, calls[0])
+        if not any(ins.mnemonic == "cmp" and ins.op_str == "dword ptr [rax + 4], 0" for ins in empty):
+            raise SessionError("暂不支持当前 ClassIn 服务列表结构。")
+        return vector, calls[1], self._qstring_field_offset(pe, code, base=("first",), node_target=calls[1])
+
+    def _verify_cdn_first(self, proxy: Any, first: int, qt: Any) -> None:
+        # The observed QVector::first chain dereferences its header once, uses
+        # index zero, then Qt5's signed QArrayData offset. Unknown chains fail.
+        # Match each short wrapper completely: merely seeing one dereference
+        # would also accept a future helper that advances to a different node.
+        templates = [
+            [("mov", "qword ptr [rsp + 8], rcx"), ("sub", "rsp, 0x28"),
+             ("mov", "rcx, qword ptr [rsp + 0x30]"), ("call", "direct"),
+             ("add", "rsp, 0x28"), ("ret", "")],
+            [("mov", "qword ptr [rsp + 8], rcx"), ("sub", "rsp, 0x38"),
+             ("mov", "rax, qword ptr [rsp + 0x40]"), ("mov", "rax, qword ptr [rax]"),
+             ("mov", "qword ptr [rsp + 0x20], rax"), ("xor", "edx, edx"),
+             ("mov", "rcx, qword ptr [rsp + 0x20]"), ("call", "direct"),
+             ("nop", ""), ("add", "rsp, 0x38"), ("ret", "")],
+            [("mov", "qword ptr [rsp + 0x10], rdx"), ("mov", "qword ptr [rsp + 8], rcx"),
+             ("sub", "rsp, 0x28"), ("mov", "rcx, qword ptr [rsp + 0x30]"),
+             ("call", "direct"), ("add", "rsp, 0x28"), ("ret", "")],
+            [("mov", "qword ptr [rsp + 8], rcx"), ("sub", "rsp, 0x28"),
+             ("mov", "rcx, qword ptr [rsp + 0x30]"), ("call", "import"),
+             ("add", "rsp, 0x28"), ("ret", "")],
+        ]
+        import capstone.x86 as x
+        for index, template in enumerate(templates):
+            code = self._code(proxy, first, 256)
+            shape = [(ins.mnemonic, ("direct" if ins.operands[0].type == x.X86_OP_IMM else "import")
+                      if ins.mnemonic == "call" else ins.op_str) for ins in code]
+            if shape != template:
+                raise SessionError("暂不支持当前 ClassIn 服务列表结构。")
+            imports = [self._import_at(proxy, ins) for ins in code if self._import_at(proxy, ins)]
+            calls = self._direct_calls(code, proxy)
+            if index == 3:
+                if imports != [("qt5core.dll", "?data@QArrayData@@QEBAPEBXXZ")] or calls:
+                    raise SessionError("暂不支持当前 ClassIn 服务列表结构。")
+            elif imports or len(calls) != 1:
+                raise SessionError("暂不支持当前 ClassIn 服务列表结构。")
+            else:
+                first = calls[0]
+        data = self._code(qt, self._export(qt, "?data@QArrayData@@QEBAPEBXXZ"), 64)
+        if [(ins.mnemonic, ins.op_str) for ins in data] != [
+                ("mov", "rax, qword ptr [rcx + 0x10]"), ("add", "rax, rcx"), ("ret", "")]:
+            raise SessionError("暂不支持当前 ClassIn Qt 服务数据结构。")
 
     def _returned_global(self, pe: Any, rva: int, mnemonic: str) -> int:
         import capstone.x86 as x
@@ -768,26 +1038,60 @@ class _NativeSource:
             secret = reader.qstring(core + self.secret_offset)
             if not uid or not secret:
                 raise SessionError("ClassIn 登录失败，请登录成功后扫描。")
-            state = base_base + self.token_global
-            token_uid = reader.qword(state + 112)
-            token = reader.qstring(state + 80) if token_uid == uid else ""
-            refresh = reader.qstring(state + 88) if token_uid == uid else ""
-            device_map = reader.qstring(state + 168)
+            token = refresh = ""
+            if self.token_global is not None:
+                state = base_base + self.token_global
+                token_uid = reader.qword(state + 112)
+                token = reader.qstring(state + 80) if token_uid == uid else ""
+                refresh = reader.qstring(state + 88) if token_uid == uid else ""
+                device_map = reader.qstring(state + 168)
+            elif self.device_map_global is not None:
+                device_map = reader.qstring(base_base + self.device_map_global)
+            else:
+                raise SessionError("暂不支持当前 ClassIn 设备字段结构。")
+            dynamic_host, static_host = self._cdn_urls(reader, settings)
             parts = dict(item.split("=", 1) for item in device_map.split(",") if "=" in item)
             snapshot = _Snapshot(uid=uid, secret=secret,
                                  telephone=reader.qstring(core + self.telephone_offset),
-                                 dynamic_host=_origin(reader.qstring(settings + self.dynamic_offset)),
-                                 static_host=_origin(reader.qstring(settings + self.static_offset)),
+                                 dynamic_host=dynamic_host, static_host=static_host,
                                  token=token, refresh_token=refresh, token_expiry=_token_expiry(token),
                                  device_map=device_map, device_id=reader.qstring(base_base + self.device_global),
                                  client_version=parts.get("version", ""),
                                  cache_directory=Path(reader.qstring(base_base + self.cache_global)))
             # Detect a concurrent logout/account switch while copying fields.
-            if reader.qword(core + self.uid_offset) != uid or reader.read(settings + self.login_offset, 1) != b"\x01":
+            if (reader.qword(core_base + self.core_global) != core
+                    or reader.qword(core + self.config_offset) != config
+                    or reader.qword(config + self.settings_offset) != settings
+                    or reader.qword(core + self.uid_offset) != uid
+                    or reader.qstring(core + self.secret_offset) != secret
+                    or reader.read(settings + self.login_offset, 1) != b"\x01"):
                 raise SessionError("ClassIn 登录状态已变化，请重新扫描。")
             return snapshot
         finally:
             reader.close()
+
+    def _cdn_urls(self, reader: _Reader, settings: int) -> tuple[str, str]:
+        if self.cdn_manager_offset is None:
+            return (_origin(reader.qstring(settings + self.dynamic_offset)),
+                    _origin(reader.qstring(settings + self.static_offset)))
+        manager = reader.qword(settings + self.cdn_manager_offset)
+        header = reader.qword(manager + self.cdn_vector_offset)
+        raw = reader.read(header, 24)
+        _, count, _, offset = struct.unpack("<iiQq", raw)
+        if not 1 <= count <= 256 or not 24 <= offset <= 1024 * 1024:
+            raise SessionError("ClassIn 当前服务列表为空或格式无法识别。")
+        first = header + offset
+        # Node QString pointers can change in place without reallocating the
+        # vector. Compare the exact first-node fields as well as its header.
+        node_size = max(self.dynamic_offset, self.static_offset) + 8
+        node = reader.read(first, node_size)
+        urls = (_origin(reader.qstring(first + self.dynamic_offset)),
+                _origin(reader.qstring(first + self.static_offset)))
+        if (reader.qword(settings + self.cdn_manager_offset) != manager
+                or reader.qword(manager + self.cdn_vector_offset) != header
+                or reader.read(header, 24) != raw or reader.read(first, node_size) != node):
+            raise SessionError("ClassIn 当前服务配置已变化，请重新扫描。")
+        return urls
 
 
 def load_current_session(install_dir: str | Path | None = None, roaming_dir: str | Path | None = None,
