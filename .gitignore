@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+exports/
+.build/
+dist/
+*.log
+docs/
+analysis/
+.impeccable/
+preview/
+tests/
+design-qa.md
+DESIGN.md
+PRODUCT.md
+report.md
