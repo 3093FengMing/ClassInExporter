@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from functools import partial
+from typing import Callable
 
 
 if not getattr(sys, "frozen", False):
@@ -18,10 +20,13 @@ def self_test(output: Path) -> int:
     """Exercise packaged dependencies without opening a native login session."""
     result: dict[str, object] = {"ok": False, "frozen": bool(getattr(sys, "frozen", False))}
     application = window = None
+    flush_deferred_deletes: Callable[[], None] | None = None
     try:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
         os.environ.pop("IMAGEIO_FFMPEG_EXE", None)
         from PySide6.QtCore import QCoreApplication, QEvent
+        flush_deferred_deletes = partial(QCoreApplication.sendPostedEvents, None,
+                                        QEvent.Type.DeferredDelete)
         result["qt_core"] = True
         from PySide6.QtWidgets import QApplication
         result["qt_widgets"] = True
@@ -61,7 +66,7 @@ def self_test(output: Path) -> int:
         executable = Path(sys.executable)
         portable_image = pefile.PE(str(executable), fast_load=True)
         try:
-            if portable_image.FILE_HEADER.Machine != 0x8664:
+            if getattr(portable_image.FILE_HEADER, "Machine", None) != 0x8664:
                 raise RuntimeError("The executable is not Windows x64")
         finally:
             portable_image.close()
@@ -108,8 +113,8 @@ def self_test(output: Path) -> int:
         if window is not None:
             window.close()
             window.deleteLater()
-        if application is not None:
-            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        if application is not None and flush_deferred_deletes is not None:
+            flush_deferred_deletes()
             application.processEvents()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

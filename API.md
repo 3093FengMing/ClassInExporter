@@ -1,6 +1,6 @@
 # API 与实现导读
 
-既有实测记录针对 ClassIn 6.0.5.4000（Windows x64）。其他版本需要重新核验原生结构，不能仅凭版本号沿用内存布局。
+既有实测记录针对 ClassIn 6.0.5.4000（Windows x64）。
 
 项目采用 [PolyForm Noncommercial 1.0.0](LICENSE)，复制或分发源码及允许的派生作品时须保留 [NOTICE](NOTICE) 中的署名与许可信息。第三方依赖各自保留其许可。许可不授予课程、录播或机构 API 的访问权限。
 
@@ -24,6 +24,14 @@
 
 当前 getter 路径从安装文件的导出符号及指令推导，运行时模块基址另行发现。**固定 RVA、虚表偏移和原生对象布局不是通用 HTTP 接口**。适配新版本时，应重新验证导出符号、转发目标、字段读写指令与账号一致性；不符合预期时停止读取，而不是沿用旧地址猜测。
 
+### native 获取的职责与更新兼容性
+
+`session.load_current_session()` 检测主进程，读取当前账号 UID、会话签名字段、access/refresh token、设备与客户端信息、API/CDN 配置和缓存目录。`ClassInSession` 用这些信息签名请求，并复核登录和账号是否变化。课程及云盘分页、资料详情、原件刷新和下载由后续 HTTP 适配器完成；音视频处理位于下载器与 FFmpeg 链路。
+
+动态模块基址和导出函数分析能适应加载地址及部分函数位置变化，但当前实现仍依赖已验证的虚函数表槽位、令牌状态字段和 Qt 字符串布局。**不能据此保证任意新版兼容。** 更新后应依次验证会话读取、最小只读请求、资源刷新和小文件完整下载；结构验证失败时会报告客户端结构无法识别。
+
+复用时宜把 native 会话读取与 HTTP 协议适配分开维护。新版改变对象布局时更新前者；接口、签名或响应字段变化时核验后者。官方机构 SDK 使用 SID 和机构密钥，是另一种授权来源，适合独立机构适配器。
+
 ## 源码模块导读
 
 | 模块 | 可以复用的职责 |
@@ -36,7 +44,7 @@
 | [cache.py](classin_exporter/cache.py) | 只读解析 Qt 磁盘缓存、正文完整性、缓存资源索引 |
 | [downloader.py](classin_exporter/downloader.py) | `DownloadManager`、远程优先、完整缓存回退、HLS、取消、摘要与原子完成 |
 | [resources.py](classin_exporter/resources.py) | `Resource`、`ScanResult`、`DownloadResult` 数据结构 |
-| [grouping.py](classin_exporter/grouping.py) | 课程与云盘分组、稳定目录命名 |
+| [grouping.py](classin_exporter/grouping.py) | 课程与云盘分组、无 hash 目录命名、重名编号和全量扫描目录计划 |
 | [gui.py](classin_exporter/gui.py) | Qt 后台扫描、并发批量下载与主线程事件协调 |
 | [gui_workspace.py](classin_exporter/gui_workspace.py)、[gui_views.py](classin_exporter/gui_views.py) | 原生 Qt 布局、绘制和交互；独立 HTTP 实现无需依赖界面层 |
 

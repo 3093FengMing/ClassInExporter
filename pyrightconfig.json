@@ -1,0 +1,7 @@
+{
+  "include": ["classin_exporter", "build/launcher.py", "preview", "run.py"],
+  "exclude": [".venv", ".git", ".build", "dist", "exports", "analysis", "docs", ".impeccable", "**/__pycache__"],
+  "typeCheckingMode": "standard",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows"
+}

@@ -1,5 +1,10 @@
 """Layout construction for the Chinese course resource desktop workspace."""
 
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QGridLayout, QHBoxLayout,
@@ -13,8 +18,12 @@ from .gui_views import (
     ThreadSpinBox, workspace_stylesheet,
 )
 
+if TYPE_CHECKING:
+    from .gui import ExporterApp
 
-def _label(text="", role=None, name=None, bounded=False):
+
+def _label(text: str = "", role: str | None = None, name: str | None = None,
+           bounded: bool = False) -> QLabel:
     widget = BoundedDetailLabel(text) if bounded else QLabel(text)
     if role:
         widget.setProperty("role", role)
@@ -24,13 +33,13 @@ def _label(text="", role=None, name=None, bounded=False):
     return widget
 
 
-def _quiet(app, text, callback):
+def _quiet(app: ExporterApp, text: str, callback: Callable[[], None]) -> QPushButton:
     button = app._button(text, callback)
     button.setProperty("quiet", True)
     return button
 
 
-def build_workspace(app, project_root, kind_labels):
+def build_workspace(app: ExporterApp, project_root: Path, kind_labels: dict[str, str]) -> None:
     central = QWidget()
     central.setObjectName("workspace")
     app.setCentralWidget(central)
@@ -300,7 +309,7 @@ def build_workspace(app, project_root, kind_labels):
     app.output_dir.setMaximumWidth(270)
     app.output_dir.setAccessibleName("资源导出目录，可直接编辑")
     output_label.setBuddy(app.output_dir)
-    def describe_output(value):
+    def describe_output(value: str) -> None:
         app.output_dir.setToolTip(value)
         app.output_dir.setAccessibleDescription("完整导出目录：" + value)
     app.output_dir.textChanged.connect(describe_output)
@@ -366,14 +375,14 @@ def build_workspace(app, project_root, kind_labels):
     installrow.addWidget(app.install_button)
     settings.addLayout(installrow)
     threads = QHBoxLayout()
-    for name, attribute in (("获取线程", "scan_threads"), ("下载线程", "download_threads")):
+    app.scan_threads = ThreadSpinBox()
+    app.download_threads = ThreadSpinBox()
+    for name, control in (("获取线程", app.scan_threads), ("下载线程", app.download_threads)):
         label = _label(name)
-        control = ThreadSpinBox()
         control.setRange(1, 16)
         control.setValue(4)
         control.setAccessibleName(name + "数，1至16，默认4")
         label.setBuddy(control)
-        setattr(app, attribute, control)
         threads.addWidget(label)
         threads.addWidget(control)
         threads.addSpacing(24)

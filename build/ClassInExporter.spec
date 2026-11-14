@@ -36,7 +36,7 @@ version_info = VSVersionInfo(
     kids=[
         StringFileInfo([
             StringTable("040904B0", [
-                StringStruct("FileDescription", "ClassIn resource exporter"),
+                StringStruct("FileDescription", "ClassInExporter"),
                 StringStruct("FileVersion", "0.4.0"),
                 StringStruct("InternalName", "ClassInExporter"),
                 StringStruct("OriginalFilename", "ClassInExporter.exe"),

@@ -6,12 +6,12 @@ paint the name/context hierarchy and readable status within the existing model.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QPalette, QPainter, QPen, QTextLayout, QTextOption
+from PySide6.QtCore import QAbstractItemModel, QEvent, QModelIndex, QPersistentModelIndex, QRect, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QPaintEvent, QPalette, QPainter, QPen, QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QLabel, QLineEdit, QSpinBox, QStyle,
     QStyleFactory, QStyledItemDelegate, QStyleOption, QStyleOptionFrame,
-    QStyleOptionSpinBox, QStyleOptionViewItem,
+    QStyleOptionSpinBox, QStyleOptionViewItem, QWidget,
 )
 
 
@@ -36,7 +36,7 @@ TOKENS = {
 class ExportPathEdit(QLineEdit):
     """Show an unambiguous elided path when idle; edit the complete value."""
 
-    def paintEvent(self, event):
+    def paintEvent(self, event: QPaintEvent) -> None:
         if self.hasFocus():
             super().paintEvent(event)
             return
@@ -58,12 +58,15 @@ class ExportPathEdit(QLineEdit):
 class ThreadSpinBox(QSpinBox):
     """Retain native stepping and add legible standard Qt arrow primitives."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._arrow_style = QStyleFactory.create("Fusion")
+        arrow_style = QStyleFactory.create("Fusion")
+        if arrow_style is None:
+            raise RuntimeError("Qt Fusion style is unavailable")
+        self._arrow_style = arrow_style
         self._arrow_style.setParent(self)
 
-    def paintEvent(self, event):
+    def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
         option = QStyleOptionSpinBox()
@@ -95,7 +98,7 @@ class BoundedDetailLabel(QLabel):
     already short uses QLabel's native painting and text selection unchanged.
     """
 
-    def paintEvent(self, event):
+    def paintEvent(self, event: QPaintEvent) -> None:
         if self.heightForWidth(self.width()) <= self.height() or self.hasSelectedText():
             super().paintEvent(event)
             return
@@ -211,10 +214,11 @@ def workspace_stylesheet() -> str:
 class ResourceDelegate(QStyledItemDelegate):
     """Display a two-line name, with native checkbox and selection behavior."""
 
-    def sizeHint(self, option, index):
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex | QPersistentModelIndex) -> QSize:
         return QSize(super().sizeHint(option, index).width(), 49)
 
-    def paint(self, painter, option, index):
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem,
+              index: QModelIndex | QPersistentModelIndex) -> None:
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         if index.column() == 0:
@@ -266,7 +270,8 @@ class ResourceDelegate(QStyledItemDelegate):
                              Qt.TextFlag.TextWordWrap, display)
         painter.restore()
 
-    def editorEvent(self, event, model, option, index):
+    def editorEvent(self, event: QEvent, model: QAbstractItemModel, option: QStyleOptionViewItem,
+                    index: QModelIndex | QPersistentModelIndex) -> bool:
         if index.column() == 0:
             option = QStyleOptionViewItem(option)
             option.rect = option.rect.adjusted(10, 0, 0, 0)
@@ -276,7 +281,8 @@ class ResourceDelegate(QStyledItemDelegate):
 class CourseDelegate(QStyledItemDelegate):
     """Paint the native sidebar item's label/count without fake interactive UI."""
 
-    def paint(self, painter, option, index):
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem,
+              index: QModelIndex | QPersistentModelIndex) -> None:
         section = bool(index.data(Qt.ItemDataRole.UserRole + 2))
         painter.save()
         font = QFont(option.font)

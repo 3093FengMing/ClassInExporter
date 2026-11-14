@@ -8,7 +8,6 @@ dist/
 docs/
 analysis/
 .impeccable/
-preview/
 tests/
 design-qa.md
 DESIGN.md

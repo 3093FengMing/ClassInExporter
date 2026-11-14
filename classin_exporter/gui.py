@@ -12,23 +12,27 @@ import time
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import requests
 from PySide6.QtCore import QEvent, QObject, QSignalBlocker, QSize, QStandardPaths, QThread, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QFont, QFontDatabase, QKeyEvent, QKeySequence, QResizeEvent, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget, QTabBar, QSpinBox, QDialog, QListWidgetItem,
+    QCheckBox, QListWidget, QSplitter, QStackedWidget,
 )
 
 from .downloader import DownloadCancelled, DownloadError, DownloadManager
-from .resources import Resource, ScanResult
-from .grouping import group_labels, resource_group, resource_output_dir
+from .resources import DownloadResult, Resource, ScanResult
+from .grouping import group_directory_names, group_labels, resource_group, resource_output_dir
 from .gui_workspace import build_workspace
 from .gui_views import TOKENS
+
+if TYPE_CHECKING:
+    from .discovery import ClassInClient
 
 
 PROJECT_ROOT = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
@@ -146,7 +150,7 @@ class WorkerEvent:
 class _OperationThread(QThread):
     """Own the callable until Qt has delivered its finished signal."""
 
-    def __init__(self, operation: str, target: Callable, worker: BackgroundWorker):
+    def __init__(self, operation: str, target: Callable[[], None], worker: BackgroundWorker):
         super().__init__(worker)
         self.operation = operation
         self.target = target
@@ -171,14 +175,14 @@ class BackgroundWorker(QObject):
 
     event_ready = Signal(object)
 
-    def __init__(self, client_factory: Callable = _make_client,
-                 manager_factory: Callable = DownloadManager,
-                 manifest_reader: Callable = _read_manifest, parent: QObject | None = None):
+    def __init__(self, client_factory: Callable[..., ClassInClient] = _make_client,
+                 manager_factory: Callable[..., DownloadManager] = DownloadManager,
+                 manifest_reader: Callable[[str], list[Resource]] = _read_manifest, parent: QObject | None = None):
         super().__init__(parent)
         self.client_factory = client_factory
         self.manager_factory = manager_factory
         self.manifest_reader = manifest_reader
-        self.client = None
+        self.client: ClassInClient | None = None
         self.cancel_event = threading.Event()
         self._thread: _OperationThread | None = None
 
@@ -191,7 +195,7 @@ class BackgroundWorker(QObject):
     def _emit(self, kind: str, **data) -> None:
         self.event_ready.emit(WorkerEvent(kind, data))
 
-    def _launch(self, operation: str, target: Callable) -> bool:
+    def _launch(self, operation: str, target: Callable[[], None]) -> bool:
         if self.running:
             return False
         self.cancel_event.clear()
@@ -235,11 +239,13 @@ class BackgroundWorker(QObject):
             self._emit("import_finished", resources=self.manifest_reader(path))
         return self._launch("import", import_manifest)
 
-    def start_download(self, resources: list[Resource], output_dir: str, max_workers: int = 4) -> bool:
+    def start_download(self, resources: list[Resource], output_dir: str, max_workers: int = 4,
+                       *, resource_snapshot: list[Resource] | None = None) -> bool:
         if type(max_workers) is not int or not 1 <= max_workers <= 16:
             raise ValueError("下载线程数必须为 1–16 的整数。")
         # Checkbox/filter edits cannot change a batch already in progress.
         batch = [resource for resource in resources if selectable_resource(resource)]
+        directory_names = group_directory_names(list(resource_snapshot) if resource_snapshot is not None else resources)
 
         def download():
             completed = failed = 0
@@ -262,7 +268,8 @@ class BackgroundWorker(QObject):
                     transport = getattr(self.client, "session", None)
                     if transport is None:
                         owned_transport = transport = requests.Session()
-                    manager = self.manager_factory(resource_output_dir(output_dir, resource), session=transport)
+                    manager = self.manager_factory(resource_output_dir(output_dir, resource,
+                                                                       directory_names=directory_names), session=transport)
                     resolved = resource
                     if self.client is not None:
                         try:
@@ -343,6 +350,59 @@ class BackgroundWorker(QObject):
 
 
 class ExporterApp(QMainWindow):
+    # The external layout builder initializes these before signals are connected.
+    # Explicit declarations let editors verify both assignments and consumers.
+    navigation_toggle_button: QPushButton
+    session_text: QLabel
+    scan_button: QPushButton
+    settings_button: QPushButton
+    workspace_splitter: QSplitter
+    navigation_panel: QWidget
+    course_nav: QListWidget
+    scope_title: QLabel
+    bulk_all_button: QPushButton
+    bulk_none_button: QPushButton
+    bulk_invert_button: QPushButton
+    visible_text: QLabel
+    name_filter: QLineEdit
+    clear_filter_button: QPushButton
+    course_filter: QComboBox
+    type_filter: QComboBox
+    scope_tabs: QTabBar
+    kind_tabs: QTabBar
+    kind_tab_panel: QWidget
+    warning_panel: QWidget
+    warning_text: QLabel
+    task_button: QPushButton
+    warning_gap: QWidget
+    tree: QTreeWidget
+    header_check: QCheckBox
+    list_stack: QStackedWidget
+    empty_title: QLabel
+    empty_text: QLabel
+    detail_name: QLabel
+    detail_meta: QLabel
+    progress_bar: QProgressBar
+    output_dir: QLineEdit
+    output_button: QPushButton
+    open_output_button: QPushButton
+    progress_text: QLabel
+    log_button: QPushButton
+    selection_text: QLabel
+    action_stack: QStackedWidget
+    download_button: QPushButton
+    cancel_button: QPushButton
+    settings_dialog: QDialog
+    install_dir: QLineEdit
+    install_button: QPushButton
+    scan_threads: QSpinBox
+    download_threads: QSpinBox
+    import_button: QPushButton
+    task_dialog: QDialog
+    messages: QPlainTextEdit
+    summary_text: QLabel
+    resource_detail_text: QPlainTextEdit
+
     def __init__(self, parent: QWidget | None = None, worker: BackgroundWorker | None = None):
         super().__init__(parent)
         self.worker = worker or BackgroundWorker(parent=self)
@@ -383,7 +443,7 @@ class ExporterApp(QMainWindow):
         self._rebuild_scope_tabs()
         self._render()
 
-    def _button(self, text: str, callback: Callable, primary: bool = False) -> QPushButton:
+    def _button(self, text: str, callback: Callable[[], None], primary: bool = False) -> QPushButton:
         button = QPushButton(text)
         button.setMinimumHeight(38)
         button.setAccessibleName(text)
@@ -396,8 +456,8 @@ class ExporterApp(QMainWindow):
     def _build(self) -> None:
         build_workspace(self, PROJECT_ROOT, KIND_LABELS)
 
-    def eventFilter(self, watched, event) -> bool:
-        if watched is self.tree and event.type() == QEvent.Type.KeyPress:
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.tree and event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
             if event.key() == Qt.Key.Key_Space and not event.modifiers() & (
                     Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
                 self._space_toggle()
@@ -412,7 +472,7 @@ class ExporterApp(QMainWindow):
         self.navigation_panel.setVisible(visible)
         self.navigation_toggle_button.setText("收起课程" if visible else "展开课程")
 
-    def resizeEvent(self, event) -> None:
+    def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         if hasattr(self, "navigation_toggle_button"):
             compact = self.width() < 1120
@@ -459,7 +519,7 @@ class ExporterApp(QMainWindow):
             self.warning_text.clear()
 
     @Slot(object, object)
-    def _navigation_changed(self, current, previous=None) -> None:
+    def _navigation_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None = None) -> None:
         if current is None:
             return
         key = current.data(Qt.ItemDataRole.UserRole)
@@ -478,12 +538,12 @@ class ExporterApp(QMainWindow):
         self.scope_title.setToolTip(self.scope_title.text())
 
     @Slot(object, object)
-    def _selected_resource_changed(self, current, previous=None) -> None:
+    def _selected_resource_changed(self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None = None) -> None:
         self._detail_resource_id = current.data(0, Qt.ItemDataRole.UserRole) if current is not None else None
         self._update_detail()
 
     def _update_detail(self) -> None:
-        resource = self.resources.get(self._detail_resource_id)
+        resource = self.resources.get(self._detail_resource_id) if self._detail_resource_id is not None else None
         if resource is None:
             self.detail_name.setText("选择资源查看完整名称")
             self.detail_meta.clear()
@@ -502,6 +562,8 @@ class ExporterApp(QMainWindow):
     def show_resource_details(self, resource_id: str | None = None) -> None:
         if not isinstance(resource_id, str):
             resource_id = self._detail_resource_id
+        if resource_id is None:
+            return
         resource = self.resources.get(resource_id)
         if resource is None:
             return
@@ -555,10 +617,23 @@ class ExporterApp(QMainWindow):
             self.output_dir.setText(path)
 
     def _open_output(self) -> None:
-        path = Path(self.output_dir.text()).expanduser()
-        if not path.is_dir():
-            QMessageBox.information(self, "导出目录", "目录不存在，首次下载时会自动创建。")
-        elif not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+        output = self.output_dir.text().strip()
+        if not output:
+            QMessageBox.information(self, "导出目录", "请填写或选择导出目录。")
+            return
+        try:
+            path = Path(output).expanduser().resolve()
+            path.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            QMessageBox.warning(self, "导出目录", "导出路径已被文件占用，请重新选择目录。")
+            return
+        except PermissionError:
+            QMessageBox.warning(self, "导出目录", "没有权限创建或访问该目录，请选择有写入权限的目录。")
+            return
+        except (OSError, ValueError, RuntimeError):
+            QMessageBox.warning(self, "导出目录", "导出目录无效或无法创建，请检查路径后重新选择目录。")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
             QMessageBox.warning(self, "导出目录", "无法打开该目录。")
 
     @Slot()
@@ -600,7 +675,8 @@ class ExporterApp(QMainWindow):
         self._active_downloads.clear()
         self._finished_downloads.clear()
         self._resource_progress.clear()
-        if self.worker.start_download(resources, output_path, self.download_threads.value()):
+        if self.worker.start_download(resources, output_path, self.download_threads.value(),
+                                      resource_snapshot=list(self.resources.values())):
             for resource in resources:
                 self.statuses[resource.id] = "等待下载"
             self._set_busy("download")
@@ -773,7 +849,7 @@ class ExporterApp(QMainWindow):
                     item.setText(column, value)
                     item.setToolTip(column, value)
                     item.setForeground(column, QColor(TOKENS["secondary"] if column == 4 else TOKENS["text"]))
-                item.setData(1, Qt.ItemDataRole.UserRole + 1, f"{course} · {source}")
+                item.setData(1, Qt.ItemDataRole.UserRole + 1, f"{course}-{source}")
                 item.setData(1, Qt.ItemDataRole.AccessibleTextRole, f"{name}，{course}，{source}，{status}")
                 display_status = status
                 if not selectable and "809" in status:
@@ -787,7 +863,10 @@ class ExporterApp(QMainWindow):
             current = self.tree.currentItem()
             if current is None or current.isHidden():
                 current = next((self.items[key] for key in self.resources if key in visible_ids), None)
-                self.tree.setCurrentItem(current)
+                if current is not None:
+                    self.tree.setCurrentItem(current)
+                else:
+                    self.tree.selectionModel().clearCurrentIndex()
             self._detail_resource_id = current.data(0, Qt.ItemDataRole.UserRole) if current is not None else None
         self._update_summary()
         self._update_kind_counts()
@@ -795,7 +874,7 @@ class ExporterApp(QMainWindow):
         self.list_stack.setCurrentIndex(0 if visible_ids else 1)
         if not visible_ids:
             if not self._has_loaded:
-                self.empty_title.setText("本次获取未完成" if self._scan_failed else "登录 ClassIn，获取课程资源")
+                self.empty_title.setText("本次获取未完成" if self._scan_failed else "登录 ClassIn后获取课程资源")
                 self.empty_text.setText("查看任务详情，确认 ClassIn 已登录后重新获取。" if self._scan_failed else "点击右上方“获取资源”，自动检测本机已登录的 ClassIn。")
             elif self.name_filter.text().strip():
                 self.empty_title.setText("没有匹配的资源")
@@ -888,7 +967,7 @@ class ExporterApp(QMainWindow):
                         if key not in self._finished_downloads and total > 0)
         self._set_progress(min(100, int(100 * fraction / self._download_total)))
         if not self._closing and not self.worker.cancel_event.is_set():
-            self.progress_text.setText(f"并发下载：已结束 {len(self._finished_downloads)} / {self._download_total} 项，"
+            self.progress_text.setText(f"下载：已完成 {len(self._finished_downloads)} / {self._download_total} 项，"
                                        f"进行中 {len(self._active_downloads)} 项。")
 
     @Slot(object)
@@ -936,13 +1015,13 @@ class ExporterApp(QMainWindow):
             self._message(f"{readable_text(self.resources[resource_id].name, 100)}：{data['message']}")
             self._render()
         elif kind == "download_finished":
-            result = data["result"]
+            download_result: DownloadResult = data["result"]
             self._active_downloads.discard(data["resource_id"])
             self._finished_downloads.add(data["resource_id"])
             self._download_summary()
-            suffix = "远程" if result.source == "remote" else "完整缓存"
+            suffix = "远程原件" if download_result.source == "remote" else "完整缓存"
             self.statuses[data["resource_id"]] = f"已导出 · {suffix}"
-            self._message(f"已导出：{Path(result.path).name}（{format_size(result.bytes_written)}，{suffix}）")
+            self._message(f"已导出：{Path(download_result.path).name}（{format_size(download_result.bytes_written)}，{suffix}）")
             self._render()
         elif kind == "download_cancelled":
             self._active_downloads.discard(data["resource_id"])
@@ -966,7 +1045,7 @@ class ExporterApp(QMainWindow):
             if self._closing:
                 self.close()
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, event: QCloseEvent) -> None:
         if self.worker.running:
             event.ignore()
             self._closing = True
@@ -979,7 +1058,9 @@ class ExporterApp(QMainWindow):
 
 
 def main() -> None:
-    application = QApplication.instance() or QApplication(sys.argv)
+    application = QApplication.instance()
+    if not isinstance(application, QApplication):
+        application = QApplication(sys.argv)
     application.setApplicationName("ClassInExporter")
     window = ExporterApp()
     window.show()

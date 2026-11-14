@@ -79,7 +79,7 @@ def read_qt_cache(path: str | Path) -> CacheEntry:
         stream.setVersion(stream_version)
         url = QUrl()
         expiration, modified = QDateTime(), QDateTime()
-        stream >> url >> expiration >> modified
+        _ = stream >> url >> expiration >> modified
         stream.readBool()  # saveToDisk
         attributes = {}
         count = stream.readUInt32()
@@ -94,8 +94,8 @@ def read_qt_cache(path: str | Path) -> CacheEntry:
             raise ValueError("无效的缓存响应头数量。")
         for _ in range(count):
             key, value = QByteArray(), QByteArray()
-            stream >> key >> value
-            headers[bytes(key).decode("ascii", "ignore").lower()] = bytes(value).decode("utf-8", "replace")
+            _ = stream >> key >> value
+            headers[bytes(key.data()).decode("ascii", "ignore").lower()] = bytes(value.data()).decode("utf-8", "replace")
         compressed = stream.readBool()
         offset = file.pos()
         if stream.status() != QDataStream.Status.Ok or not url.isValid():
@@ -110,8 +110,8 @@ def read_qt_cache(path: str | Path) -> CacheEntry:
             if body_size > MAX_JSON_BYTES:
                 raise ValueError("压缩缓存超过读取上限。")
             data = QByteArray()
-            stream >> data
-            packed = bytes(data)
+            _ = stream >> data
+            packed = bytes(data.data())
             if stream.status() != QDataStream.Status.Ok or len(packed) < 4 or file.pos() != file.size():
                 raise ValueError("压缩缓存不完整。")
             declared = int.from_bytes(packed[:4], "big")

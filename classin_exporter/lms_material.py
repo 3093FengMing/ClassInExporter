@@ -67,7 +67,9 @@ def _role(context: dict) -> tuple[str, int]:
     role = context.get("role")
     if role is None:
         # The course-list membership enum is distinct from detail iJ.
-        role = {1: "student", 2: "student", 3: "teacher", 4: "teacherAssistant", 192: "manager"}.get(context.get("identity"))
+        identity = context.get("identity")
+        role = ({1: "student", 2: "student", 3: "teacher", 4: "teacherAssistant", 192: "manager"}.get(identity)
+                if isinstance(identity, int) else None)
     if role in {"teacher", "teacherAssistant", "manager"}:
         return role, 1
     if role in {"student", "auditor", "publicStudent", "publicAuditor"}:

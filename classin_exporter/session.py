@@ -576,6 +576,15 @@ class _Reader:
             raise SessionError("ClassIn 登录对象的文本格式无法识别。") from None
 
 
+def _pe_header_int(pe: object, header_name: str, field_name: str) -> int:
+    """Validate an integer from pefile's dynamically constructed headers."""
+    header = getattr(pe, header_name, None)
+    value = getattr(header, field_name, None)
+    if type(value) is not int:
+        raise SessionError("暂不支持当前 ClassIn 客户端模块结构。")
+    return value
+
+
 class _NativeSource:
     """Derive getter paths from installed code; read only those exact fields."""
     def __init__(self, api: Any, pid: int, modules: dict[str, tuple[int, int, Path]]):
@@ -590,8 +599,11 @@ class _NativeSource:
         self.md.detail = True
         self.core_pe = pefile.PE(modules["eeocoreengine.dll"][2])
         self.base_pe = pefile.PE(modules["eeobase.dll"][2])
-        if self.core_pe.FILE_HEADER.Machine != 0x8664 or self.base_pe.FILE_HEADER.Machine != 0x8664:
+        if (_pe_header_int(self.core_pe, "FILE_HEADER", "Machine") != 0x8664
+                or _pe_header_int(self.base_pe, "FILE_HEADER", "Machine") != 0x8664):
             raise SessionError("暂不支持当前 ClassIn 版本客户端结构。")
+        self.core_image_base = _pe_header_int(self.core_pe, "OPTIONAL_HEADER", "ImageBase")
+        self.base_image_base = _pe_header_int(self.base_pe, "OPTIONAL_HEADER", "ImageBase")
         self.core_global = self._returned_global(self.core_pe, self._export(self.core_pe, "?instance@CoreEngine"), "mov")
         base_token = self._code(self.base_pe, self._export(self.base_pe, "?token@EeoNetworkConfig"))
         calls = self._direct_calls(base_token)
@@ -652,7 +664,8 @@ class _NativeSource:
 
     def _code(self, pe: Any, rva: int, size: int = 2048) -> list[Any]:
         result = []
-        for ins in self.md.disasm(pe.get_data(rva, size), pe.OPTIONAL_HEADER.ImageBase + rva):
+        image_base = _pe_header_int(pe, "OPTIONAL_HEADER", "ImageBase")
+        for ins in self.md.disasm(pe.get_data(rva, size), image_base + rva):
             result.append(ins)
             if ins.mnemonic == "ret":
                 break
@@ -689,14 +702,15 @@ class _NativeSource:
         import capstone.x86 as x
         # Both supported ClassIn DLLs use this preferred image base; runtime
         # addresses are translated separately through the module inventory.
-        if self.core_pe.OPTIONAL_HEADER.ImageBase != self.base_pe.OPTIONAL_HEADER.ImageBase:
+        if self.core_image_base != self.base_image_base:
             raise SessionError("暂不支持当前 ClassIn 客户端模块结构。")
-        return [i.operands[0].imm - self.core_pe.OPTIONAL_HEADER.ImageBase
+        return [i.operands[0].imm - self.core_image_base
                 for i in code if i.mnemonic == "call" and i.operands[0].type == x.X86_OP_IMM]
 
     def _returned_global(self, pe: Any, rva: int, mnemonic: str) -> int:
         import capstone.x86 as x
-        values = [i.address + i.size + i.operands[1].mem.disp - pe.OPTIONAL_HEADER.ImageBase
+        image_base = _pe_header_int(pe, "OPTIONAL_HEADER", "ImageBase")
+        values = [i.address + i.size + i.operands[1].mem.disp - image_base
                   for i in self._code(pe, rva) if i.mnemonic == mnemonic and len(i.operands) == 2
                   and i.operands[0].type == x.X86_OP_REG and i.operands[0].reg == x.X86_REG_RAX
                   and i.operands[1].type == x.X86_OP_MEM and i.operands[1].mem.base == x.X86_REG_RIP]
@@ -706,7 +720,7 @@ class _NativeSource:
 
     def _rip_lea_rdx(self, code: list[Any]) -> list[int]:
         import capstone.x86 as x
-        return [i.address + i.size + i.operands[1].mem.disp - self.base_pe.OPTIONAL_HEADER.ImageBase
+        return [i.address + i.size + i.operands[1].mem.disp - self.base_image_base
                 for i in code if i.mnemonic == "lea" and len(i.operands) == 2
                 and i.operands[0].type == x.X86_OP_REG and i.operands[0].reg == x.X86_REG_RDX
                 and i.operands[1].type == x.X86_OP_MEM and i.operands[1].mem.base == x.X86_REG_RIP]
@@ -720,9 +734,9 @@ class _NativeSource:
         # address used by all return paths, assignments and directory setup.
         start = self._export(self.base_pe, "?getCacheDirectory@CacheManager")
         counts = Counter()
-        for ins in self.md.disasm(self.base_pe.get_data(start, 3072), self.base_pe.OPTIONAL_HEADER.ImageBase + start):
+        for ins in self.md.disasm(self.base_pe.get_data(start, 3072), self.base_image_base + start):
             if ins.mnemonic == "lea" and len(ins.operands) == 2 and ins.operands[1].type == x.X86_OP_MEM and ins.operands[1].mem.base == x.X86_REG_RIP:
-                target = ins.address + ins.size + ins.operands[1].mem.disp - self.base_pe.OPTIONAL_HEADER.ImageBase
+                target = ins.address + ins.size + ins.operands[1].mem.disp - self.base_image_base
                 section = self.base_pe.get_section_by_rva(target)
                 if section is not None and section.Characteristics & 0x80000000:
                     counts[target] += 1

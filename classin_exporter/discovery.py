@@ -129,7 +129,9 @@ def resources_from_payload(payload, source="cloud", course="") -> list[Resource]
             if node.get(key) not in (None, ""):
                 ctx[key] = node[key]
         ctx["course"] = node.get("courseName") or node.get("className") or ctx.get("course", "")
-        props = node.get("props") if isinstance(node.get("props"), dict) else {}
+        props = node.get("props")
+        if not isinstance(props, dict):
+            props = {}
         fields = {**ctx, **{k: v for k, v in node.items() if k in RESOURCE_FIELDS},
                   **{k: v for k, v in props.items() if k in RESOURCE_FIELDS}}
         canonical = all(key in node for key in ("id", "name", "kind", "source"))
@@ -506,7 +508,7 @@ class ClassInClient:
                 except Exception as error:
                     warnings.append(_folder_failure_warning(path, source, course, error))
                     break
-                context = {**request, "uid": self.auth_session.uid}
+                context = {**request, "uid": self._current_session().uid}
                 if source == "organization":
                     context["fileSource"] = 8
                 normalized = {"data": {**context, **data}} if isinstance(data, dict) else {"data": data, **context}
@@ -763,8 +765,10 @@ class ClassInClient:
         meta = resource.metadata
         if meta.get("candidate_only"):
             raise RuntimeError("该课堂回放入口没有当前可读取的录像地址，不能下载。")
-        adapter = {"lms-record": "lms_record", "lms-material": "lms_material",
-                   "lms-homework": "lms_homework"}.get(meta.get("adapter"))
+        adapter_name = meta.get("adapter")
+        adapter = ({"lms-record": "lms_record", "lms-material": "lms_material",
+                    "lms-homework": "lms_homework"}.get(adapter_name)
+                   if isinstance(adapter_name, str) else None)
         if adapter:
             module = importlib.import_module("." + adapter, __package__)
             return module.resolve_resource(session, resource)

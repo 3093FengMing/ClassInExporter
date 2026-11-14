@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipDependencyInstall,
-    [switch]$VerifyOnly
+    [switch]$VerifyOnly,
+    [string]$OutputDirectory = 'dist'
 )
 
 Set-StrictMode -Version Latest
@@ -13,7 +14,7 @@ $launcherPath = Join-Path $buildSourceDirectory 'launcher.py'
 $venvDirectory = Join-Path $projectDirectory '.venv'
 $pythonPath = Join-Path $venvDirectory 'Scripts\python.exe'
 $workDirectory = Join-Path $projectDirectory '.build'
-$distDirectory = Join-Path $projectDirectory 'dist'
+$distDirectory = [System.IO.Path]::GetFullPath((Join-Path $projectDirectory $OutputDirectory))
 $bundleDirectory = Join-Path $distDirectory 'ClassInExporter'
 $archivePath = Join-Path $distDirectory 'ClassInExporter-0.4.0-win64.zip'
 
@@ -31,9 +32,9 @@ try {
         if ($SkipDependencyInstall) {
             throw 'The local .venv is missing; run without -SkipDependencyInstall first.'
         }
-        & py -3.11 -m venv $venvDirectory
+        & py -m venv $venvDirectory
         if ($LASTEXITCODE -ne 0) {
-            throw 'Install Python 3.11 x64 to prepare the build environment.'
+            throw 'Install Python x64 to prepare the build environment.'
         }
     }
     if (-not $SkipDependencyInstall) {
@@ -42,15 +43,18 @@ try {
     $validateOutput = @'
 from pathlib import Path
 root = Path.cwd().resolve()
-for name in (".build", "dist"):
-    target = (root / name).resolve()
+import sys
+output = Path(sys.argv[1]).resolve()
+for target in ((root / ".build").resolve(), output):
     if target == root or not target.is_relative_to(root):
         raise RuntimeError("Build output must stay inside the project directory")
-exports = root / "dist" / "ClassInExporter" / "exports"
+if not output.is_relative_to((root / "dist").resolve()):
+    raise RuntimeError("Portable output must stay inside dist")
+exports = output / "ClassInExporter" / "exports"
 if exports.exists():
     raise RuntimeError("Move the portable program's existing exports before rebuilding its directory")
 '@
-    Invoke-BuildPython -Arguments @('-X', 'utf8', '-c', $validateOutput)
+    Invoke-BuildPython -Arguments @('-X', 'utf8', '-c', $validateOutput, $distDirectory)
     New-Item -ItemType Directory -Path $workDirectory -Force | Out-Null
     $syntaxCheck = @'
 import ast
